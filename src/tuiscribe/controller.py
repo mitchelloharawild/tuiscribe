@@ -48,7 +48,7 @@ class Controller:
         output: Path | None = None,  # transcript .md (sidecar .jsonl next to it)
         transcriber: Transcriber | None = None,  # None: capture + meters only
         render_opts: RenderOptions = RenderOptions(),
-        save_audio: Path | None = None,
+        audio_paths: dict[str, Path] | None = None,  # channel -> .wav to write
         partials: bool = True,
         bus: EventBus | None = None,
     ) -> None:
@@ -57,7 +57,7 @@ class Controller:
         self.output = output
         self.transcriber = transcriber
         self.render_opts = render_opts
-        self.save_audio = save_audio
+        self.audio_paths = {ch: p for ch, p in (audio_paths or {}).items() if ch in devices}
         self.partials = partials
         self.muted: dict[str, bool] = {ch: False for ch in devices}
         self.paused = False
@@ -82,10 +82,9 @@ class Controller:
     def start(self) -> None:
         self.session_start = time.monotonic()
         self.started_at = datetime.now().astimezone()
-        if self.save_audio is not None:
-            self.save_audio.mkdir(parents=True, exist_ok=True)
-            for ch in self.channels:
-                self._writers[ch] = AlignedWavWriter(self.save_audio / f"{ch}.wav", self.session_start)
+        for ch, path in self.audio_paths.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self._writers[ch] = AlignedWavWriter(path, self.session_start)
         if self.transcriber is not None:
             if self.output is not None:
                 self.writer = TranscriptWriter(self.output, self.render_opts)

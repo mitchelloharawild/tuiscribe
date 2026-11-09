@@ -91,8 +91,8 @@ class TuiscribeApp(App):
             self._log("info", "Meters only (--no-transcribe).")
         if c.transcriber is not None:
             self._log("info", f"Loading {c.transcriber.name} ... (first run downloads the model)")
-        if c.save_audio is not None:
-            self._log("info", f"Saving raw audio to {c.save_audio}/")
+        for ch, path in c.audio_paths.items():
+            self._log("info", f"Saving {CHANNEL_LABELS[ch]} audio to {path}")
         self._log("info", "Press ? for keys.")
         self.set_interval(FRAME_S, self._tick)
 

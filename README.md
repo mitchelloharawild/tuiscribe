@@ -26,7 +26,8 @@ into `~/.cache/huggingface`.
 ## Usage
 
 ```sh
-uv run tuiscribe record -o meeting.md
+uv run tuiscribe record              # -> meeting-2026-11-10-143205.md (+ .jsonl, .mic.wav, .system.wav)
+uv run tuiscribe record -o meeting.md # or choose the name
 ```
 
 This opens a live display with input meters for both channels, the transcript
@@ -48,7 +49,8 @@ Useful options (see `tuiscribe record --help`):
 - `--model`: e.g. `base.en` (faster), `medium.en` or `distil-large-v3` (more accurate, slower)
 - `--no-partials`: skip the live preview passes to save CPU
 - `--gap-short 2 --gap-long 10`: pause lengths for a new paragraph or a silence marker
-- `--save-audio DIR`: also keep `mic.wav` and `system.wav`
+- `--no-save-audio`: don't keep the audio (by default `<name>.mic.wav` and `<name>.system.wav`
+  are written next to the transcript: 16 kHz mono, time-aligned)
 - `--no-tui`: plain line output (also used automatically when not on a terminal)
 - `--no-transcribe`: meters only
 
@@ -57,7 +59,7 @@ timings. You can regenerate the Markdown from it, or transcribe saved audio agai
 
 ```sh
 uv run tuiscribe render meeting.jsonl -o meeting.md --gap-long 30
-uv run tuiscribe replay mic=rec/mic.wav system=rec/system.wav -o meeting.md
+uv run tuiscribe replay mic=meeting.mic.wav system=meeting.system.wav -o meeting-v2.md
 ```
 
 ## Output

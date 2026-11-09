@@ -32,8 +32,19 @@ GapShortOpt = Annotated[float, typer.Option(help="Pause (s) that starts a new pa
 GapLongOpt = Annotated[float, typer.Option(help="Pause (s) that gets a '⋯ N s of silence ⋯' marker.")]
 
 
-def _default_output() -> Path:
-    return Path(f"meeting-{datetime.now():%Y-%m-%d-%H%M}.md")
+def _default_output(started: datetime) -> Path:
+    return Path(f"meeting-{started:%Y-%m-%d-%H%M%S}.md")
+
+
+def _audio_paths(stem_path: Path, channels: list[str], started: datetime) -> dict[str, Path]:
+    """`<stem>.mic.wav` etc. next to the transcript; never overwrite an earlier session's audio."""
+    def paths(stem: str) -> dict[str, Path]:
+        return {ch: stem_path.with_name(f"{stem}.{ch}.wav") for ch in channels}
+
+    out = paths(stem_path.stem)
+    if any(p.exists() for p in out.values()):  # e.g. -o names an existing transcript we append to
+        out = paths(f"{stem_path.stem}-{started:%Y-%m-%d-%H%M%S}")
+    return out
 
 
 @app.command()
@@ -61,17 +72,17 @@ def devices(
 
 @app.command()
 def record(
-    output: Annotated[Path | None, typer.Option("-o", "--output", help="Transcript file (default: meeting-<date>-<time>.md). Appends if it exists.")] = None,
+    output: Annotated[Path | None, typer.Option("-o", "--output", help="Transcript file (default: meeting-<date>-<time>.md, from when recording starts). Appends if it exists.")] = None,
     mic: Annotated[str | None, typer.Option(help="Mic source: id, node name or description. Default: PipeWire default.")] = None,
     system: Annotated[str | None, typer.Option(help="Sink whose monitor is captured. Default: PipeWire default.")] = None,
     no_mic: Annotated[bool, typer.Option("--no-mic", help="Capture system audio only.")] = False,
     no_system: Annotated[bool, typer.Option("--no-system", help="Capture the mic only.")] = False,
     model: ModelOpt = "small.en",
-    no_transcribe: Annotated[bool, typer.Option("--no-transcribe", help="Meters (and --save-audio) only; no model, no transcript.")] = False,
+    no_transcribe: Annotated[bool, typer.Option("--no-transcribe", help="Meters (and saved audio) only; no model, no transcript.")] = False,
     no_partials: Annotated[bool, typer.Option("--no-partials", help="Skip live preview passes (saves CPU).")] = False,
     gap_short: GapShortOpt = 2.0,
     gap_long: GapLongOpt = 10.0,
-    save_audio: Annotated[Path | None, typer.Option(help="Also write time-aligned mic.wav / system.wav into this directory.")] = None,
+    save_audio: Annotated[bool, typer.Option("--save-audio/--no-save-audio", help="Keep time-aligned <transcript>.mic.wav / .system.wav next to the transcript.")] = True,
     duration: Annotated[float | None, typer.Option(help="Stop after this many seconds.")] = None,
     no_tui: Annotated[bool, typer.Option("--no-tui", help="Plain log output instead of the interactive display.")] = False,
 ) -> None:
@@ -93,14 +104,15 @@ def record(
         from .stt.faster_whisper import FasterWhisperTranscriber
 
         transcriber = FasterWhisperTranscriber(model)
-        output = output or _default_output()
 
+    started = datetime.now()
+    output = output or _default_output(started)
     controller = Controller(
         chosen,
         output=None if no_transcribe else output,
         transcriber=transcriber,
         render_opts=RenderOptions(gap_short=gap_short, gap_long=gap_long),
-        save_audio=save_audio,
+        audio_paths=_audio_paths(output, list(chosen), started) if save_audio else None,
         partials=not no_partials,
     )
     if no_tui or not sys.stdout.isatty():
@@ -260,8 +272,7 @@ def _print_summary(controller: Controller) -> None:
     if controller.writer is not None:
         typer.echo(f"transcript: {controller.writer.md_path} ({controller.writer.segments} segments), sidecar: {controller.writer.jsonl_path}")
     for ch, secs in controller.saved_seconds().items():
-        if controller.save_audio is not None:
-            typer.echo(f"audio: {controller.save_audio / f'{ch}.wav'} ({secs:.1f} s)")
+        typer.echo(f"audio: {controller.audio_paths[ch]} ({secs:.1f} s)")
 
 
 def _fail(msg: str) -> int:
