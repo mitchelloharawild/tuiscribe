@@ -1,0 +1,26 @@
+[project]
+name = "tuiscribe"
+version = "0.1.0"
+description = "PipeWire mic + system audio capture with live transcription to Markdown"
+readme = "README.md"
+authors = [
+    { name = "Mitchell O'Hara-Wild", email = "mail@mitchelloharawild.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.5.4",
+    "textual>=8.2.8",
+    "typer>=0.29.0",
+]
+
+[project.scripts]
+tuiscribe = "tuiscribe:main"
+
+[build-system]
+requires = ["uv_build>=0.13.7,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
