@@ -159,6 +159,8 @@ def test_live_ordering_across_channels_partials_cleared_and_note(tmp_path):
     # mic final is queued first; STT is blocked on the gate. Add a note between the two starts.
     clock[0] = 1.3
     pipe.add_note("## Mid note")
+    # notes travel through the audio queue; wait until the VAD thread has queued it
+    assert wait_for(lambda: len(pipe._merger) >= 1)
     gate.set()
     pipe.stop()
 

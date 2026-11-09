@@ -69,6 +69,7 @@ class Controller:
         self._sources: dict[str, PwRecordSource] = {}
         self._writers: dict[str, AlignedWavWriter] = {}
         self._cmd_lock = threading.Lock()
+        self._switch_lock = threading.Lock()
         self.stopping = threading.Event()
         self.stopped = threading.Event()
 
@@ -116,21 +117,31 @@ class Controller:
 
     def stop(self) -> None:
         """Stop capture, transcribe what is still pending, write the footer. May take a while."""
-        if self.stopping.is_set():
+        with self._cmd_lock:  # no source switch or note can start mid-stop
+            if self.stopping.is_set():
+                already = True
+            else:
+                already = False
+                self.stopping.set()
+        if already:
             self.stopped.wait()
             return
-        self.stopping.set()
-        for src in self._sources.values():
-            src.stop()
-        for w in self._writers.values():
-            w.close()
-        for ch, src in self._sources.items():
-            self.bus.publish(SourceEvent(ch, src.device, "stopped"))
-        if self.pipeline is not None:
-            self.pipeline.stop()
-        if self.writer is not None:
-            self.writer.footer(datetime.now().astimezone(), self.elapsed())
-        self.stopped.set()
+        try:
+            with self._switch_lock:  # wait for an in-flight switch to finish
+                for src in self._sources.values():
+                    src.stop()
+            for w in self._writers.values():
+                w.close()
+            for ch, src in self._sources.items():
+                self.bus.publish(SourceEvent(ch, src.device, "stopped"))
+            finished = self.pipeline.stop() if self.pipeline is not None else True
+            if self.writer is not None:
+                if finished:
+                    self.writer.footer(datetime.now().astimezone(), self.elapsed())
+                else:
+                    self.writer.close()
+        finally:
+            self.stopped.set()
 
     def elapsed(self) -> float:
         return time.monotonic() - self.session_start if self.session_start else 0.0
@@ -138,7 +149,12 @@ class Controller:
     # --- commands -----------------------------------------------------------
 
     def apply(self, cmd: Command) -> None:
+        if isinstance(cmd, SwitchSource):
+            self._switch(cmd.channel, cmd.device)
+            return
         with self._cmd_lock:
+            if self.stopping.is_set():
+                return
             match cmd:
                 case SetMute(channel, muted):
                     new = (not self.muted[channel]) if muted is None else muted
@@ -159,16 +175,23 @@ class Controller:
                         self.bus.publish(StatusEvent("warning", "notes need transcription enabled"))
                     elif text.strip():
                         self.pipeline.add_note(text)
-                case SwitchSource(channel, device):
-                    src = self._sources[channel]
-                    self.devices[channel] = device
-                    src.stop()
-                    if self.pipeline is not None:
-                        self.pipeline.flush(channel)
-                    src.device = device
-                    self._start_source(src)
                 case Quit():
                     pass  # the caller runs stop(), which can block while STT drains
+
+    def _switch(self, channel: str, device: Device) -> None:
+        # Slow (stops and starts pw-record), so it has its own lock and does not
+        # block mute/pause/note, which only take _cmd_lock briefly.
+        with self._switch_lock:
+            if self.stopping.is_set():
+                return
+            src = self._sources[channel]
+            self.devices[channel] = device
+            src.stop()
+            if self.pipeline is not None:
+                self.pipeline.flush(channel)
+            src.device = device
+            if not self.stopping.is_set():
+                self._start_source(src)
 
     # --- polling (UI timer) ------------------------------------------------
 
@@ -219,4 +242,6 @@ class Controller:
             self.pipeline.feed(channel, t0 - self.session_start, samples)
 
     def _on_source_error(self, channel: str, message: str) -> None:
+        if self.pipeline is not None:
+            self.pipeline.flush(channel)  # otherwise its open speech holds back the other channel
         self.bus.publish(SourceEvent(channel, self.devices[channel], "lost", message))

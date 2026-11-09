@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import signal
 import sys
 import time
@@ -107,7 +108,11 @@ def record(
     else:
         from .tui.app import TuiscribeApp
 
-        TuiscribeApp(controller, duration=duration).run()
+        tui = TuiscribeApp(controller, duration=duration)
+        tui.run()
+        if tui.abandoned:
+            typer.secho("abandoned: speech still being transcribed was not written; no footer.", fg="yellow", err=True)
+            os._exit(130)
     _print_summary(controller)
 
 
@@ -207,8 +212,13 @@ def _run_plain(controller: Controller, duration: float | None) -> None:
                 next_line += 5.0
                 typer.secho(f"{controller.elapsed():7.1f}s  {_levels_line(controller)}", dim=True, err=True)
     finally:
-        typer.secho("stopping: transcribing what is left ...", dim=True, err=True)
-        controller.stop()
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        typer.secho("stopping: transcribing what is left ... (Ctrl-C again to abandon)", dim=True, err=True)
+        try:
+            controller.stop()
+        except KeyboardInterrupt:
+            typer.secho("abandoned: pending speech was not written; no footer.", fg="yellow", err=True)
+            os._exit(130)
         _print_events(controller)
         signal.signal(signal.SIGINT, old)
         signal.signal(signal.SIGTERM, old_term)

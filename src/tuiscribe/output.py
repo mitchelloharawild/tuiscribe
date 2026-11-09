@@ -51,6 +51,8 @@ class TranscriptWriter:
         """Append one item; returns the Markdown that was appended."""
         with self._lock:
             assert self._started_at is not None, "header() first"
+            if self.closed:
+                raise ValueError(f"{self.md_path} is already closed (footer written)")
             md = render_item(self._prev, item, self._started_at, self.opts)
             self._write(md, item)
             self._prev = item

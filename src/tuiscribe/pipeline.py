@@ -64,7 +64,10 @@ class Pipeline:
         self.clock = clock
         self.partials = partials
 
-        self._chunks: queue.Queue = queue.Queue(maxsize=max_queue_chunks)
+        # Unbounded so control messages (flush/note/stop) never block; audio is
+        # bounded in feed() instead.
+        self._chunks: queue.Queue = queue.Queue()
+        self.max_queue_chunks = max_queue_chunks
         self._finals: queue.Queue[Utterance | None] = queue.Queue()
         self._partials: dict[str, Partial] = {}
         self._partials_lock = threading.Lock()
@@ -94,10 +97,10 @@ class Pipeline:
 
     def feed(self, channel: str, t: float, samples: np.ndarray) -> None:
         """Capture thread: hand over a chunk starting at session time `t`."""
-        try:
-            self._chunks.put_nowait(("chunk", channel, t, samples))
-        except queue.Full:
+        if self._chunks.qsize() >= self.max_queue_chunks or self._vad_done.is_set():
             self.dropped_chunks += 1
+            return
+        self._chunks.put(("chunk", channel, t, samples))
 
     def flush(self, channel: str | None = None) -> None:
         """End open utterances (mute, pause, source switch)."""
@@ -107,11 +110,16 @@ class Pipeline:
         # Goes through the chunk queue so it is ordered after audio already captured.
         self._chunks.put(("note", None, 0.0, Note(at=self.clock(), text=text)))
 
-    def stop(self, timeout: float = 120.0) -> None:
-        """Finish all pending speech, write it, and stop the workers."""
+    def stop(self, timeout: float | None = None) -> bool:
+        """Finish all pending speech, write it, and stop the workers.
+
+        Waits for the STT backlog (and a model still loading) unless `timeout`
+        is given. Returns False if the workers were still running at the timeout.
+        """
         self._chunks.put(("stop", None, 0.0, None))
         self._vad_thread.join(timeout)
         self._stt_thread.join(timeout)
+        return not (self._vad_thread.is_alive() or self._stt_thread.is_alive())
 
     def stats(self) -> PipelineStats:
         return PipelineStats(
@@ -126,10 +134,28 @@ class Pipeline:
     # --- VAD thread ---------------------------------------------------------------
 
     def _vad_loop(self) -> None:
+        try:
+            self._vad_loop_inner()
+        except Exception as e:  # noqa: BLE001 - never leave stop() waiting on a dead thread
+            self.bus.publish(StatusEvent("error", f"voice detection stopped: {e}"))
+        finally:
+            if not self._vad_done.is_set():
+                self._vad_done.set()
+                self._finals.put(None)
+
+    def _vad_loop_inner(self) -> None:
+        errors = 0
         while True:
             kind, channel, t, samples = self._chunks.get()
             if kind == "chunk":
-                self._process_chunk(channel, t, samples)
+                try:
+                    self._process_chunk(channel, t, samples)
+                except Exception as e:  # noqa: BLE001
+                    errors += 1
+                    if errors <= 3:
+                        self.bus.publish(StatusEvent("error", f"voice detection error ({channel}): {e}", channel))
+                    self._vads[channel].reset()
+                    self._buf_t[channel] = None
             elif kind == "flush":
                 for ch in [channel] if channel else self.channels:
                     self._flush_channel(ch)
@@ -153,6 +179,8 @@ class Pipeline:
         if buf_t is None or abs((buf_t + pending / SAMPLE_RATE) - t) > DISCONTINUITY_S:
             self._flush_channel(ch)
             buf_t = t
+        else:
+            buf_t = t - pending / SAMPLE_RATE  # absorb small drift/drops without a cut
         for window, prob in vad.process(samples):
             self._handle(self._segs[ch].push(buf_t, window, prob))
             buf_t += WINDOW / SAMPLE_RATE
@@ -284,7 +312,7 @@ class Pipeline:
         if self.writer is not None:
             try:
                 md = self.writer.item(item)
-            except OSError as e:
+            except (OSError, ValueError) as e:
                 self.bus.publish(StatusEvent("error", f"could not write transcript: {e}"))
         self.bus.publish(FinalEvent(item, md))
 
@@ -293,9 +321,17 @@ class Pipeline:
         return text[-PROMPT_CHARS:] or None
 
     def _drain_without_model(self) -> None:
+        """No model: drop speech, but still write notes (they need no STT)."""
         while True:
-            utt = self._finals.get()
+            try:
+                utt = self._finals.get(timeout=0.5)
+            except queue.Empty:
+                utt = False
+            with self._inflight_lock:
+                self._inflight.clear()  # nothing will ever be transcribed
+            self._release()
             if utt is None and self._vad_done.is_set():
+                self._release(final=True)
                 return
 
 

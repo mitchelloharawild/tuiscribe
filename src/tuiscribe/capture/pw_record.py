@@ -15,6 +15,7 @@ from __future__ import annotations
 import subprocess
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 
 import numpy as np
@@ -67,6 +68,7 @@ class PwRecordSource:
         self._stopping = threading.Event()
         self.samples_read = 0
         self.stream_start: float | None = None
+        self._stderr_tail: deque[str] = deque(maxlen=5)
 
     @property
     def running(self) -> bool:
@@ -88,7 +90,20 @@ class PwRecordSource:
         self._thread = threading.Thread(
             target=self._read_loop, name=f"capture-{self.channel}", daemon=True
         )
+        self._stderr_tail = deque(maxlen=5)
         self._thread.start()
+        threading.Thread(
+            target=self._drain_stderr, args=(self._proc, self._stderr_tail),
+            name=f"capture-{self.channel}-stderr", daemon=True,
+        ).start()
+
+    @staticmethod
+    def _drain_stderr(proc: subprocess.Popen[bytes], tail: deque[str]) -> None:
+        # Read continuously so a chatty pw-record can never block on a full pipe.
+        assert proc.stderr is not None
+        for line in iter(proc.stderr.readline, b""):
+            if text := line.decode(errors="replace").strip():
+                tail.append(text)
 
     def stop(self, timeout: float = 2.0) -> None:
         self._stopping.set()
@@ -135,8 +150,6 @@ class PwRecordSource:
 
         if not self._stopping.is_set() and self._on_error is not None:
             proc.wait()
-            err = (proc.stderr.read().decode(errors="replace").strip() if proc.stderr else "")
-            self._on_error(
-                self.channel,
-                f"pw-record exited ({proc.returncode})" + (f": {err.splitlines()[-1]}" if err else ""),
-            )
+            time.sleep(0.05)  # let the stderr drain thread catch the last line
+            err = self._stderr_tail[-1] if self._stderr_tail else ""
+            self._on_error(self.channel, f"pw-record exited ({proc.returncode})" + (f": {err}" if err else ""))

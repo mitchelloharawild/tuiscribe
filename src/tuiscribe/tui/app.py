@@ -8,6 +8,7 @@ Commands go back through `Controller.apply()`; anything that can block
 
 from __future__ import annotations
 
+import threading
 import time
 from datetime import datetime
 
@@ -61,6 +62,7 @@ class TuiscribeApp(App):
         self._cpu_pct = 0.0
         self._finishing = False
         self._quit_presses = 0
+        self.abandoned = False
 
     # --- layout -----------------------------------------------------------------
 
@@ -199,6 +201,8 @@ class TuiscribeApp(App):
             return
 
         def chosen(device: Device | None) -> None:
+            if self._finishing:
+                return
             if device is not None and device.name != self.controller.devices[channel].name:
                 self._switch(channel, device)
 
@@ -213,6 +217,9 @@ class TuiscribeApp(App):
             return
 
         def done(text: str | None) -> None:
+            if self._finishing:
+                self._log("warning", "Stopping: note not added.")
+                return
             if text:
                 self.controller.apply(AddNote(text))
                 self._log("info", f"note queued: {text}")
@@ -226,7 +233,8 @@ class TuiscribeApp(App):
         self._quit_presses += 1
         if self._finishing:
             if self._quit_presses >= 3:
-                self.exit()  # give up waiting; pending speech is lost, footer not written
+                self.abandoned = True  # cli exits the process; pending speech is lost
+                self.exit()
             else:
                 self._log("warning", "Still transcribing the last utterances. Press again to abandon them.")
             return
@@ -234,10 +242,17 @@ class TuiscribeApp(App):
         self._log("info", "Stopping capture; transcribing what is left…")
         self._stop_and_exit()
 
-    @work(thread=True)
     def _stop_and_exit(self) -> None:
-        self.controller.stop()
-        self.call_from_thread(self._final_drain_and_exit)
+        # A plain daemon thread, not a Textual worker: Textual waits for its
+        # executor threads at exit, which would defeat "press q to abandon".
+        def run() -> None:
+            self.controller.stop()
+            try:
+                self.call_from_thread(self._final_drain_and_exit)
+            except RuntimeError:
+                pass  # app already exited
+
+        threading.Thread(target=run, name="stop", daemon=True).start()
 
     def _final_drain_and_exit(self) -> None:
         for ev in self.controller.bus.drain():

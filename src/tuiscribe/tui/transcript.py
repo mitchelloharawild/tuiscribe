@@ -27,6 +27,7 @@ class TranscriptView(Vertical):
         self.started_at: datetime | None = None
         self._prev: Item | None = None
         self._partials: dict[str, tuple[int, float, str]] = {}  # channel -> (seq, start, text)
+        self._cleared: dict[str, int] = {}  # channel -> highest seq that has ended
 
     def compose(self):
         yield RichLog(wrap=True, markup=False, max_lines=2000, auto_scroll=True, id="finals")
@@ -63,7 +64,10 @@ class TranscriptView(Vertical):
 
     def set_partial(self, channel: str, seq: int, start: float, text: str) -> None:
         cur = self._partials.get(channel)
+        if text and seq <= self._cleared.get(channel, 0):
+            return  # a late partial for an utterance that already ended
         if not text:
+            self._cleared[channel] = max(seq, self._cleared.get(channel, 0))
             # clear only if it belongs to this utterance (or an older one)
             if cur is not None and cur[0] <= seq:
                 del self._partials[channel]
