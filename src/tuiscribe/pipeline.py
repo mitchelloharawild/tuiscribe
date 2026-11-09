@@ -104,8 +104,8 @@ class Pipeline:
         self._chunks.put(("flush", channel, 0.0, None))
 
     def add_note(self, text: str) -> None:
-        with self._merger_lock:
-            self._merger.add(Note(at=self.clock(), text=text))
+        # Goes through the chunk queue so it is ordered after audio already captured.
+        self._chunks.put(("note", None, 0.0, Note(at=self.clock(), text=text)))
 
     def stop(self, timeout: float = 120.0) -> None:
         """Finish all pending speech, write it, and stop the workers."""
@@ -133,6 +133,12 @@ class Pipeline:
             elif kind == "flush":
                 for ch in [channel] if channel else self.channels:
                     self._flush_channel(ch)
+            elif kind == "note":
+                # Added here, after all audio captured before the note has been
+                # through VAD, so any speech that started earlier is already in
+                # flight and holds the watermark.
+                with self._merger_lock:
+                    self._merger.add(samples)
             elif kind == "stop":
                 for ch in self.channels:
                     self._flush_channel(ch)
