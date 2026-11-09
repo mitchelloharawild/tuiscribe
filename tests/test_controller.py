@@ -79,6 +79,6 @@ def test_explicit_mute_values(ctl):
 def test_mute_publishes_status(ctl):
     ctl.apply(SetMute("system"))
     ev = ctl.bus.drain()
-    assert ev == [StatusEvent("info", "system muted", "system")]
+    assert ev == [StatusEvent("info", "SYSTEM muted", "system")]
     ctl.apply(SetMute("system"))
-    assert ctl.bus.drain() == [StatusEvent("info", "system unmuted", "system")]
+    assert ctl.bus.drain() == [StatusEvent("info", "SYSTEM unmuted", "system")]

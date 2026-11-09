@@ -1,8 +1,9 @@
 """Owns the capture pipeline and applies commands from the UI.
 
-No UI imports: the TUI, `--no-tui` and (later) `replay` all drive this class.
-Build steps 1-2 cover capture, levels, mute, source switching and optional
-raw-audio saving; VAD/STT stages attach to `_on_chunk` in later steps.
+No UI imports: the TUI and `--no-tui` both drive this class. Capture threads
+call `_on_chunk`, which updates the meters and hands audio to the
+transcription `Pipeline` (unless the channel is muted or transcription is
+paused).
 """
 
 from __future__ import annotations
@@ -18,17 +19,24 @@ from .audio.wav import AlignedWavWriter
 from .capture.devices import Device
 from .capture.levels import LevelAccumulator
 from .capture.pw_record import PwRecordSource
-from .config import DIGITAL_SILENCE
+from .config import CHANNEL_LABELS, DIGITAL_SILENCE
 from .events import (
+    AddNote,
     Command,
     EventBus,
     LevelEvent,
     Quit,
     SetMute,
+    SetPause,
     SourceEvent,
     StatusEvent,
     SwitchSource,
 )
+from .output import TranscriptWriter
+from .pipeline import Pipeline, PipelineStats
+from .records import Header
+from .render import RenderOptions
+from .stt import Transcriber
 
 CLIP_LINEAR = 0.999
 
@@ -37,19 +45,31 @@ class Controller:
     def __init__(
         self,
         devices: dict[str, Device],  # channel -> device, e.g. {"mic": ..., "system": ...}
+        output: Path | None = None,  # transcript .md (sidecar .jsonl next to it)
+        transcriber: Transcriber | None = None,  # None: capture + meters only
+        render_opts: RenderOptions = RenderOptions(),
         save_audio: Path | None = None,
+        partials: bool = True,
         bus: EventBus | None = None,
     ) -> None:
         self.bus = bus or EventBus()
         self.devices = dict(devices)
+        self.output = output
+        self.transcriber = transcriber
+        self.render_opts = render_opts
         self.save_audio = save_audio
+        self.partials = partials
         self.muted: dict[str, bool] = {ch: False for ch in devices}
+        self.paused = False
         self.session_start = 0.0
         self.started_at: datetime | None = None
+        self.writer: TranscriptWriter | None = None
+        self.pipeline: Pipeline | None = None
         self._levels = {ch: LevelAccumulator() for ch in devices}
         self._sources: dict[str, PwRecordSource] = {}
         self._writers: dict[str, AlignedWavWriter] = {}
         self._cmd_lock = threading.Lock()
+        self.stopping = threading.Event()
         self.stopped = threading.Event()
 
     @property
@@ -64,9 +84,21 @@ class Controller:
         if self.save_audio is not None:
             self.save_audio.mkdir(parents=True, exist_ok=True)
             for ch in self.channels:
-                self._writers[ch] = AlignedWavWriter(
-                    self.save_audio / f"{ch}.wav", self.session_start
+                self._writers[ch] = AlignedWavWriter(self.save_audio / f"{ch}.wav", self.session_start)
+        if self.transcriber is not None:
+            if self.output is not None:
+                self.writer = TranscriptWriter(self.output, self.render_opts)
+                self.writer.header(
+                    Header(
+                        started_at=self.started_at,
+                        sources={ch: d.description for ch, d in self.devices.items()},
+                        model=self.transcriber.name,
+                    )
                 )
+            self.pipeline = Pipeline(
+                self.channels, self.transcriber, self.writer, self.bus, self.elapsed, partials=self.partials
+            )
+            self.pipeline.start()
         for ch, dev in self.devices.items():
             src = PwRecordSource(ch, dev, self._on_chunk, self._on_source_error)
             self._sources[ch] = src
@@ -83,12 +115,21 @@ class Controller:
             )
 
     def stop(self) -> None:
+        """Stop capture, transcribe what is still pending, write the footer. May take a while."""
+        if self.stopping.is_set():
+            self.stopped.wait()
+            return
+        self.stopping.set()
         for src in self._sources.values():
             src.stop()
         for w in self._writers.values():
             w.close()
         for ch, src in self._sources.items():
             self.bus.publish(SourceEvent(ch, src.device, "stopped"))
+        if self.pipeline is not None:
+            self.pipeline.stop()
+        if self.writer is not None:
+            self.writer.footer(datetime.now().astimezone(), self.elapsed())
         self.stopped.set()
 
     def elapsed(self) -> float:
@@ -102,19 +143,34 @@ class Controller:
                 case SetMute(channel, muted):
                     new = (not self.muted[channel]) if muted is None else muted
                     self.muted[channel] = new
+                    if new and self.pipeline is not None:
+                        self.pipeline.flush(channel)
                     self.bus.publish(
-                        StatusEvent("info", f"{channel} {'muted' if new else 'unmuted'}", channel)
+                        StatusEvent("info", f"{CHANNEL_LABELS[channel]} {'muted' if new else 'unmuted'}", channel)
                     )
+                case SetPause(paused):
+                    new = (not self.paused) if paused is None else paused
+                    self.paused = new
+                    if new and self.pipeline is not None:
+                        self.pipeline.flush()
+                    self.bus.publish(StatusEvent("info", "transcription paused" if new else "transcription resumed"))
+                case AddNote(text):
+                    if self.pipeline is None:
+                        self.bus.publish(StatusEvent("warning", "notes need transcription enabled"))
+                    elif text.strip():
+                        self.pipeline.add_note(text)
                 case SwitchSource(channel, device):
                     src = self._sources[channel]
                     self.devices[channel] = device
                     src.stop()
+                    if self.pipeline is not None:
+                        self.pipeline.flush(channel)
                     src.device = device
                     self._start_source(src)
                 case Quit():
-                    self.stop()
+                    pass  # the caller runs stop(), which can block while STT drains
 
-    # --- levels (polled by the UI at a fixed rate) --------------------------
+    # --- polling (UI timer) ------------------------------------------------
 
     def poll_levels(self) -> dict[str, LevelEvent | None]:
         out: dict[str, LevelEvent | None] = {}
@@ -132,6 +188,9 @@ class Controller:
                 )
             )
         return out
+
+    def stats(self) -> PipelineStats | None:
+        return self.pipeline.stats() if self.pipeline is not None else None
 
     def saved_seconds(self) -> dict[str, float]:
         return {ch: w.seconds for ch, w in self._writers.items()}
@@ -156,7 +215,8 @@ class Controller:
         writer = self._writers.get(channel)
         if writer is not None:
             writer.write(t0, samples)
-        # Build step 3+: hand (channel, t0, samples) to the VAD/segmenter here.
+        if self.pipeline is not None and not self.paused:
+            self.pipeline.feed(channel, t0 - self.session_start, samples)
 
     def _on_source_error(self, channel: str, message: str) -> None:
         self.bus.publish(SourceEvent(channel, self.devices[channel], "lost", message))

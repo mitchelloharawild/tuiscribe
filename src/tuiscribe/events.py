@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from .capture.devices import Device
+from .records import Item
 
 # --- events -----------------------------------------------------------------
 
@@ -44,7 +45,23 @@ class StatusEvent:
     channel: str | None = None
 
 
-Event = SourceEvent | StatusEvent  # PartialEvent / FinalEvent arrive with STT (build step 3+)
+@dataclass(frozen=True)
+class PartialEvent:
+    """In-progress text for an utterance; empty text clears the live line."""
+
+    channel: str
+    seq: int
+    start: float
+    text: str
+
+
+@dataclass(frozen=True)
+class FinalEvent:
+    item: Item  # Segment or Note, in file order
+    markdown: str  # exactly what was appended to the .md file
+
+
+Event = SourceEvent | StatusEvent | PartialEvent | FinalEvent
 
 
 # --- commands ---------------------------------------------------------------
@@ -63,11 +80,21 @@ class SwitchSource:
 
 
 @dataclass(frozen=True)
+class SetPause:
+    paused: bool | None = None  # None toggles
+
+
+@dataclass(frozen=True)
+class AddNote:
+    text: str  # raw Markdown, e.g. "## Action items"
+
+
+@dataclass(frozen=True)
 class Quit:
     pass
 
 
-Command = SetMute | SwitchSource | Quit
+Command = SetMute | SwitchSource | SetPause | AddNote | Quit
 
 
 # --- bus --------------------------------------------------------------------
