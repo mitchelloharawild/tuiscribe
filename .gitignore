@@ -8,3 +8,6 @@ __pycache__/
 recordings/
 /meeting*.md
 /meeting*.jsonl
+
+# local development notes
+_dev/

@@ -185,7 +185,7 @@ def replay(
     diarize: DiarizeOpt = None,
     speaker_threshold: SpeakerThresholdOpt = 0.5,
 ) -> None:
-    """Run the transcription pipeline on recorded audio (e.g. from --save-audio)."""
+    """Run the transcription pipeline on recorded audio (e.g. the saved .wav files)."""
     from .audio.decode import load_audio
     from .output import TranscriptWriter, sidecar_path
     from .pipeline import transcribe_offline

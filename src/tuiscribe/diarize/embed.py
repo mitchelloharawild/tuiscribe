@@ -1,7 +1,7 @@
 """Speaker embeddings from a small ONNX model (no torch).
 
-Default: 3D-Speaker CAM++ trained on VoxCeleb (English), 512-dim, ~28 MB,
-~0.1 s of one CPU core per 3.5 s utterance. Exported to ONNX by sherpa-onnx.
+Default: 3D-Speaker CAM++ trained on VoxCeleb (English), 512-dim, about 28 MB,
+exported to ONNX by sherpa-onnx.
 Input is 80-bin Kaldi fbank (25 ms / 10 ms, povey window) with the
 per-utterance mean removed.
 
@@ -19,7 +19,7 @@ import numpy as np
 
 from ..config import SAMPLE_RATE
 
-RELEASES = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models"  # sic
+RELEASES = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models"  # sic: the release tag is misspelt
 
 
 @dataclass(frozen=True)

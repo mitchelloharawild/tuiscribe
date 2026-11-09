@@ -1,4 +1,4 @@
-"""Time-aligned WAV writer for raw-audio capture (`record --save-audio`).
+"""Time-aligned WAV writer for the saved `.mic.wav` and `.system.wav` files.
 
 Chunks are placed by their capture time relative to the session start, so a
 gap (source switch, device dropout) is filled with silence and the mic and
