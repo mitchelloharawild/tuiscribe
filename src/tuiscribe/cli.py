@@ -15,7 +15,7 @@ from typing import Annotated
 import typer
 
 from .capture.devices import Device, DeviceError, list_devices, resolve
-from .config import CHANNEL_LABELS
+from .config import CHANNEL_LABELS, CHANNELS
 from .controller import Controller
 from .events import FinalEvent, PartialEvent, SourceEvent, StatusEvent
 from .records import Header, Note, Segment, from_json
@@ -30,6 +30,49 @@ app = typer.Typer(
 ModelOpt = Annotated[str, typer.Option("--model", help="faster-whisper model: tiny.en, base.en, small.en, medium.en, distil-large-v3, ...")]
 GapShortOpt = Annotated[float, typer.Option(help="Pause (s) that starts a new paragraph for the same speaker.")]
 GapLongOpt = Annotated[float, typer.Option(help="Pause (s) that gets a '⋯ N s of silence ⋯' marker.")]
+DiarizeOpt = Annotated[
+    list[str] | None,
+    typer.Option(
+        "--diarize",
+        metavar="INPUTS",
+        help="Label separate speakers within these inputs: mic, system or all "
+        "(comma-separated or repeated). E.g. --diarize system -> Remote 1, Remote 2, ...",
+    ),
+]
+SpeakerThresholdOpt = Annotated[
+    float,
+    typer.Option(help="Voice similarity (0-1) needed to count as the same speaker. Lower merges more voices."),
+]
+CHANNEL_ALIASES = {"mic": "mic", "microphone": "mic", "system": "system", "sys": "system"}
+
+
+def _diarize_channels(values: list[str] | None, available: list[str]) -> list[str]:
+    """Parse --diarize values into channels; warns about inputs that are not being recorded."""
+    wanted: list[str] = []
+    for value in values or []:
+        for part in value.split(","):
+            name = part.strip().lower()
+            if not name:
+                continue
+            if name in ("all", "both"):
+                chans = list(CHANNELS)
+            elif name in CHANNEL_ALIASES:
+                chans = [CHANNEL_ALIASES[name]]
+            else:
+                raise typer.BadParameter(f"unknown input '{part.strip()}' (use mic, system or all)", param_hint="--diarize")
+            wanted += [c for c in chans if c not in wanted]
+    for ch in wanted:
+        if ch not in available:
+            typer.secho(f"warning: --diarize {ch}: that input is not being transcribed", fg="yellow", err=True)
+    return [ch for ch in wanted if ch in available]
+
+
+def _make_diarizer(channels: list[str], threshold: float):
+    if not channels:
+        return None
+    from .diarize import Diarizer
+
+    return Diarizer(channels, threshold=threshold)
 
 
 def _default_output(started: datetime) -> Path:
@@ -82,6 +125,8 @@ def record(
     no_partials: Annotated[bool, typer.Option("--no-partials", help="Skip live preview passes (saves CPU).")] = False,
     gap_short: GapShortOpt = 2.0,
     gap_long: GapLongOpt = 10.0,
+    diarize: DiarizeOpt = None,
+    speaker_threshold: SpeakerThresholdOpt = 0.5,
     save_audio: Annotated[bool, typer.Option("--save-audio/--no-save-audio", help="Keep time-aligned <transcript>.mic.wav / .system.wav next to the transcript.")] = True,
     duration: Annotated[float | None, typer.Option(help="Stop after this many seconds.")] = None,
     no_tui: Annotated[bool, typer.Option("--no-tui", help="Plain log output instead of the interactive display.")] = False,
@@ -99,6 +144,7 @@ def record(
     except DeviceError as e:
         raise typer.Exit(_fail(str(e)))
 
+    diarize_chans = _diarize_channels(diarize, [] if no_transcribe else list(chosen))
     transcriber = None
     if not no_transcribe:
         from .stt.faster_whisper import FasterWhisperTranscriber
@@ -114,6 +160,7 @@ def record(
         render_opts=RenderOptions(gap_short=gap_short, gap_long=gap_long),
         audio_paths=_audio_paths(output, list(chosen), started) if save_audio else None,
         partials=not no_partials,
+        diarizer=_make_diarizer(diarize_chans, speaker_threshold),
     )
     if no_tui or not sys.stdout.isatty():
         _run_plain(controller, duration)
@@ -135,6 +182,8 @@ def replay(
     model: ModelOpt = "small.en",
     gap_short: GapShortOpt = 2.0,
     gap_long: GapLongOpt = 10.0,
+    diarize: DiarizeOpt = None,
+    speaker_threshold: SpeakerThresholdOpt = 0.5,
 ) -> None:
     """Run the transcription pipeline on recorded audio (e.g. from --save-audio)."""
     from .audio.decode import load_audio
@@ -157,12 +206,15 @@ def replay(
         names[ch] = Path(path).name
         typer.echo(f"{CHANNEL_LABELS[ch]:<7} {path} ({len(audio[ch]) / 16000:.1f} s)")
 
+    diarizer = _make_diarizer(_diarize_channels(diarize, list(audio)), speaker_threshold)
     for p in (output, sidecar_path(output)):
         p.unlink(missing_ok=True)
     tr = FasterWhisperTranscriber(model)
     typer.echo(f"loading {tr.name} ...")
     t0 = time.monotonic()
     tr.load()
+    if diarizer is not None:
+        diarizer.load()
     writer = TranscriptWriter(output, RenderOptions(gap_short=gap_short, gap_long=gap_long))
     started_at = datetime.now().astimezone()
     writer.header(Header(started_at=started_at, sources=names, model=tr.name))
@@ -172,9 +224,13 @@ def replay(
             typer.echo(f"[{i}/{n}] {fmt_clock(started_at, seg.start)} {seg.label}: {seg.text}")
 
     t1 = time.monotonic()
-    transcribe_offline(audio, tr, writer, progress)
+    segs = transcribe_offline(audio, tr, writer, progress, diarizer=diarizer)
     audio_s = max(len(a) for a in audio.values()) / 16000
     writer.footer(started_at + timedelta(seconds=audio_s), audio_s)
+    if diarizer is not None:
+        for ch in sorted(diarizer.channels):
+            n = len({s.speaker for s in segs if s.channel == ch})
+            typer.echo(f"{CHANNEL_LABELS[ch]}: {n} speaker{'s' if n != 1 else ''}")
     typer.echo(f"wrote {output} ({writer.segments} segments; STT {time.monotonic() - t1:.1f} s for {audio_s:.1f} s audio, load {t1 - t0:.1f} s)")
 
 
@@ -271,6 +327,8 @@ def _print_events(controller: Controller) -> None:
 def _print_summary(controller: Controller) -> None:
     if controller.writer is not None:
         typer.echo(f"transcript: {controller.writer.md_path} ({controller.writer.segments} segments), sidecar: {controller.writer.jsonl_path}")
+    if controller.relabelled:
+        typer.echo(f"speaker labels revised for {controller.relabelled} segments after the session")
     for ch, secs in controller.saved_seconds().items():
         typer.echo(f"audio: {controller.audio_paths[ch]} ({secs:.1f} s)")
 

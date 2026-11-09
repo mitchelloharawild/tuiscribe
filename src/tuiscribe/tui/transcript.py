@@ -12,6 +12,20 @@ from ..records import SPEAKER_FOR_CHANNEL, Item, Note, Segment
 from ..render import RenderOptions, fmt_clock, fmt_duration
 
 SPEAKER_STYLE = {"mic": "bold cyan", "system": "bold magenta"}
+# Diarized speakers ("Remote 2", ...) cycle through these per channel.
+SPEAKER_PALETTE = {
+    "mic": ["bold cyan", "bold blue", "bold green", "bold bright_cyan"],
+    "system": ["bold magenta", "bold yellow", "bold red", "bold bright_magenta", "bold bright_yellow", "bold bright_red"],
+}
+
+
+def speaker_style(seg: Segment) -> str:
+    if seg.speaker:
+        number = seg.speaker.rsplit(" ", 1)[-1]
+        palette = SPEAKER_PALETTE.get(seg.channel)
+        if palette and number.isdigit():
+            return palette[(int(number) - 1) % len(palette)]
+    return SPEAKER_STYLE.get(seg.channel, "bold")
 
 
 class TranscriptView(Vertical):
@@ -54,7 +68,7 @@ class TranscriptView(Vertical):
                 log.write(Text(""))
         if new_block:
             head = Text()
-            head.append(seg.label, SPEAKER_STYLE.get(seg.channel, "bold"))
+            head.append(seg.label, speaker_style(seg))
             if self.started_at is not None:
                 head.append(f" · {fmt_clock(self.started_at, seg.start)}", "dim")
             if isinstance(prev, Segment) and seg.start < prev.end and seg.channel != prev.channel:

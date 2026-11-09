@@ -12,6 +12,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -38,6 +39,9 @@ from .records import Header
 from .render import RenderOptions
 from .stt import Transcriber
 
+if TYPE_CHECKING:
+    from .diarize import Diarizer
+
 CLIP_LINEAR = 0.999
 
 
@@ -51,6 +55,7 @@ class Controller:
         audio_paths: dict[str, Path] | None = None,  # channel -> .wav to write
         partials: bool = True,
         bus: EventBus | None = None,
+        diarizer: Diarizer | None = None,  # speaker labels within channels
     ) -> None:
         self.bus = bus or EventBus()
         self.devices = dict(devices)
@@ -59,6 +64,8 @@ class Controller:
         self.render_opts = render_opts
         self.audio_paths = {ch: p for ch, p in (audio_paths or {}).items() if ch in devices}
         self.partials = partials
+        self.diarizer = diarizer
+        self.relabelled = 0  # segments whose speaker changed in the end-of-session re-clustering
         self.muted: dict[str, bool] = {ch: False for ch in devices}
         self.paused = False
         self.session_start = 0.0
@@ -96,7 +103,13 @@ class Controller:
                     )
                 )
             self.pipeline = Pipeline(
-                self.channels, self.transcriber, self.writer, self.bus, self.elapsed, partials=self.partials
+                self.channels,
+                self.transcriber,
+                self.writer,
+                self.bus,
+                self.elapsed,
+                partials=self.partials,
+                diarizer=self.diarizer,
             )
             self.pipeline.start()
         for ch, dev in self.devices.items():
@@ -136,11 +149,24 @@ class Controller:
             finished = self.pipeline.stop() if self.pipeline is not None else True
             if self.writer is not None:
                 if finished:
+                    self._relabel()
                     self.writer.footer(datetime.now().astimezone(), self.elapsed())
                 else:
                     self.writer.close()
         finally:
             self.stopped.set()
+
+    def _relabel(self) -> None:
+        """Rewrite this session's speaker labels from whole-session clustering."""
+        if self.pipeline is None or self.writer is None:
+            return
+        try:
+            self.relabelled = self.writer.relabel(self.pipeline.final_speakers())
+        except Exception as e:  # noqa: BLE001 - keep the live labels; still write the footer
+            self.bus.publish(StatusEvent("error", f"could not update speaker labels: {e}"))
+            return
+        if self.relabelled:
+            self.bus.publish(StatusEvent("info", f"speaker labels revised for {self.relabelled} segments"))
 
     def elapsed(self) -> float:
         return time.monotonic() - self.session_start if self.session_start else 0.0

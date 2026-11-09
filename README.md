@@ -47,6 +47,8 @@ Useful options (see `tuiscribe record --help`):
 - `--mic`, `--system`: pick a device by id, node name or part of its name (see `devices`)
 - `--no-mic`, `--no-system`: record one channel only
 - `--model`: e.g. `base.en` (faster), `medium.en` or `distil-large-v3` (more accurate, slower)
+- `--diarize system` (or `mic`, `mic,system`, `all`): tell voices apart within an input.
+  System audio becomes **Remote 1**, **Remote 2**, ..., the mic becomes **Local 1**, ... (see below)
 - `--no-partials`: skip the live preview passes to save CPU
 - `--gap-short 2 --gap-long 10`: pause lengths for a new paragraph or a silence marker
 - `--no-save-audio`: don't keep the audio (by default `<name>.mic.wav` and `<name>.system.wav`
@@ -61,6 +63,24 @@ timings. You can regenerate the Markdown from it, or transcribe saved audio agai
 uv run tuiscribe render meeting.jsonl -o meeting.md --gap-long 30
 uv run tuiscribe replay mic=meeting.mic.wav system=meeting.system.wav -o meeting-v2.md
 ```
+
+### Speaker labels (prototype)
+
+The mic and system audio are already separate, so `--diarize` only separates voices *within*
+an input, e.g. several people on the call. Each utterance gets a voiceprint from a small speaker
+model (3D-Speaker CAM++, 28 MB, downloaded on first use into `~/.cache/tuiscribe/models`),
+which costs about 0.1 s of one CPU core per utterance. Labels are assigned live. When you stop,
+the whole session is clustered again and the transcript is rewritten with the corrected labels.
+
+```sh
+uv run tuiscribe record --diarize system
+uv run tuiscribe replay system=meeting.system.wav -o redo.md --diarize system
+```
+
+Limits: labels are numbers, not names. Utterances under about 1 s ("yeah") get the nearest or the
+previous speaker. Two people talking without a pause in between, or over each other, get one label.
+If one person is split into two speakers, lower `--speaker-threshold` (default 0.5); if two people
+are merged, raise it.
 
 ## Output
 

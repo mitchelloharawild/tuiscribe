@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import threading
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -34,6 +35,9 @@ class TranscriptWriter:
         self._jsonl = self.jsonl_path.open("a", encoding="utf-8")
         self._needs_sep = existing
         self.closed = False
+        # This session's records and where they start, so relabel() can rewrite them.
+        self._session: list[Header | Item] = []
+        self._offsets = (0, 0)
 
     def _write(self, md: str, rec) -> None:
         self._md.write(md)
@@ -44,8 +48,12 @@ class TranscriptWriter:
     def header(self, h: Header) -> None:
         with self._lock:
             self._started_at = h.started_at
-            sep = "\n\n" if self._needs_sep else ""
-            self._write(sep + render_header(h), h)
+            self._offsets = (self._md.tell(), self._jsonl.tell())
+            self._session = [h]
+            self._write(self._header_md(h), h)
+
+    def _header_md(self, h: Header) -> str:
+        return ("\n\n" if self._needs_sep else "") + render_header(h)
 
     def item(self, item: Item) -> str:
         """Append one item; returns the Markdown that was appended."""
@@ -55,10 +63,42 @@ class TranscriptWriter:
                 raise ValueError(f"{self.md_path} is already closed (footer written)")
             md = render_item(self._prev, item, self._started_at, self.opts)
             self._write(md, item)
+            self._session.append(item)
             self._prev = item
             if isinstance(item, Segment):
                 self.segments += 1
             return md
+
+    def relabel(self, speakers: dict[tuple[str, float], str]) -> int:
+        """Set `speaker` on this session's segments, keyed by (channel, start), and
+        rewrite the session in both files. Returns the number of segments changed."""
+        with self._lock:
+            if self.closed or not self._session:
+                return 0
+            new: list[Header | Item] = []
+            changed = 0
+            for rec in self._session:
+                if isinstance(rec, Segment) and (rec.channel, rec.start) in speakers:
+                    sp = speakers[(rec.channel, rec.start)]
+                    if sp != rec.speaker:
+                        rec = replace(rec, speaker=sp)
+                        changed += 1
+                new.append(rec)
+            if not changed:
+                return 0
+            md_at, jsonl_at = self._offsets
+            for fh, at in ((self._md, md_at), (self._jsonl, jsonl_at)):
+                fh.flush()
+                fh.truncate(at)
+                fh.seek(at)
+            header, items = new[0], new[1:]
+            self._write(self._header_md(header), header)
+            prev: Item | None = None
+            for item in items:
+                self._write(render_item(prev, item, self._started_at, self.opts), item)
+                prev = item
+            self._session, self._prev = new, prev
+            return changed
 
     def footer(self, ended_at: datetime, duration: float) -> None:
         with self._lock:

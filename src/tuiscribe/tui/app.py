@@ -164,6 +164,9 @@ class TuiscribeApp(App):
                 if st.latency is not None:
                     parts.append(f"latency {st.latency:.1f} s")
                 parts.append(f"{st.segments} segments")
+                d = self.controller.pipeline.diarizer if self.controller.pipeline else None
+                if d is not None:
+                    parts.append(", ".join(f"{CHANNEL_LABELS[ch].lower()} {d.speakers(ch)} spk" for ch in sorted(d.channels)))
             if st.dropped_chunks:
                 parts.append(f"dropped {st.dropped_chunks} chunks")
         parts.append(f"CPU {self._cpu_pct:.0f}%")

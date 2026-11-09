@@ -19,7 +19,8 @@ from __future__ import annotations
 import queue
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -31,6 +32,9 @@ from .merge import Merger
 from .output import TranscriptWriter
 from .records import Item, Note, Segment
 from .stt import Transcriber
+
+if TYPE_CHECKING:
+    from .diarize import Diarizer
 
 PROMPT_CHARS = 200  # previous text of the same channel given to Whisper as context
 DISCONTINUITY_S = 0.25  # capture timeline jump that resets VAD state (switch/dropout)
@@ -56,6 +60,7 @@ class Pipeline:
         clock: Callable[[], float],  # current session time in seconds
         partials: bool = True,
         max_queue_chunks: int = 3000,  # ~60 s of 20 ms chunks
+        diarizer: Diarizer | None = None,
     ) -> None:
         self.channels = channels
         self.transcriber = transcriber
@@ -63,6 +68,8 @@ class Pipeline:
         self.bus = bus
         self.clock = clock
         self.partials = partials
+        self.diarizer = diarizer
+        self._diarize_errors = 0
 
         # Unbounded so control messages (flush/note/stop) never block; audio is
         # bounded in feed() instead.
@@ -220,6 +227,7 @@ class Pipeline:
             self.transcriber.load()
             self.model_state = "ready"
             self.bus.publish(StatusEvent("info", f"{self.transcriber.name} ready"))
+            self._load_diarizer()
         except Exception as e:  # noqa: BLE001 - report any load failure to the UI
             self.model_state = "error"
             self.bus.publish(StatusEvent("error", f"could not load {self.transcriber.name}: {e}"))
@@ -279,11 +287,13 @@ class Pipeline:
         finally:
             self._busy = False
         if tr is not None and tr.text:
+            start = round(utt.start, 3)
             seg = Segment(
                 channel=utt.channel,
-                start=round(utt.start, 3),
+                start=start,
                 end=round(utt.end, 3),
                 text=tr.text,
+                speaker=self._speaker(utt.channel, start, utt.audio, utt.end - utt.start),
                 no_speech_prob=None if tr.no_speech_prob is None else round(tr.no_speech_prob, 4),
                 avg_logprob=None if tr.avg_logprob is None else round(tr.avg_logprob, 4),
             )
@@ -296,6 +306,33 @@ class Pipeline:
         with self._inflight_lock:
             self._inflight.pop((utt.channel, utt.seq), None)
         self._release()
+
+    # --- speakers (STT thread) ----------------------------------------------------
+
+    def _load_diarizer(self) -> None:
+        if self.diarizer is None:
+            return
+        try:
+            self.diarizer.load()
+            self.bus.publish(StatusEvent("info", f"speaker labels on for {', '.join(sorted(self.diarizer.channels))}"))
+        except Exception as e:  # noqa: BLE001 - transcription goes on without speaker labels
+            self.bus.publish(StatusEvent("warning", f"speaker labels off: could not load the speaker model: {e}"))
+            self.diarizer = None
+
+    def _speaker(self, channel: str, start: float, audio: np.ndarray, duration: float) -> str | None:
+        if self.diarizer is None or not self.diarizer.applies(channel):
+            return None
+        try:
+            return self.diarizer.label((channel, start), audio, duration)
+        except Exception as e:  # noqa: BLE001
+            self._diarize_errors += 1
+            if self._diarize_errors <= 3:
+                self.bus.publish(StatusEvent("warning", f"speaker label failed: {e}", channel))
+            return None
+
+    def final_speakers(self) -> dict[tuple[str, float], str]:
+        """Labels from re-clustering the whole session; call after stop()."""
+        return self.diarizer.final_labels() if self.diarizer is not None else {}
 
     def _watermark(self) -> float:
         with self._inflight_lock:
@@ -355,7 +392,10 @@ def transcribe_offline(
     transcriber: Transcriber,
     writer: TranscriptWriter | None,
     progress: Callable[[int, int, Segment | None], None] | None = None,
+    diarizer: Diarizer | None = None,
 ) -> list[Segment]:
+    """Transcribe whole recordings. With a `diarizer`, segments get live-style labels
+    as they are written, then the session is relabelled from whole-file clustering."""
     utterances = sorted(
         (u for ch, a in audio.items() for u in segment_audio(ch, a)), key=lambda u: u.start
     )
@@ -365,7 +405,11 @@ def transcribe_offline(
         tr = transcriber.transcribe(utt.audio, last_text.get(utt.channel, "")[-PROMPT_CHARS:] or None)
         seg = None
         if tr.text:
-            seg = Segment(utt.channel, round(utt.start, 3), round(utt.end, 3), tr.text,
+            start = round(utt.start, 3)
+            speaker = None
+            if diarizer is not None and diarizer.applies(utt.channel):
+                speaker = diarizer.label((utt.channel, start), utt.audio, utt.end - utt.start)
+            seg = Segment(utt.channel, start, round(utt.end, 3), tr.text, speaker=speaker,
                           no_speech_prob=tr.no_speech_prob, avg_logprob=tr.avg_logprob)  # fmt: skip
             last_text[utt.channel] = tr.text
             segments.append(seg)
@@ -373,4 +417,9 @@ def transcribe_offline(
                 writer.item(seg)
         if progress is not None:
             progress(i + 1, len(utterances), seg)
+    if diarizer is not None:
+        final = diarizer.final_labels()
+        if writer is not None:
+            writer.relabel(final)
+        segments = [replace(s, speaker=final.get((s.channel, s.start), s.speaker)) for s in segments]
     return segments
