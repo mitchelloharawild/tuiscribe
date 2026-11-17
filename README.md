@@ -7,6 +7,10 @@
 
 Live meeting transcription in the terminal, for Linux with PipeWire.
 
+<p align="center">
+  <img src="assets/demo/tuiscribe.gif" alt="tuiscribe recording a two-person call: input meters, live partial transcripts that settle into You and Remote lines, a silence marker, an added note, then a clean stop" width="800">
+</p>
+
 tuiscribe records your **microphone** and your **system audio** (everything you
 hear) as two separate inputs and transcribes both as you talk. It uses
 [faster-whisper](https://github.com/SYSTRAN/faster-whisper) on the CPU, so
