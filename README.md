@@ -1,11 +1,9 @@
-<p align="center">
+<h1 align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/logo/tuiscribe-dark.svg">
-    <img src="assets/logo/tuiscribe.svg" alt="tuiscribe logo: a terminal prompt and microphone over transcript lines" width="112">
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo/tuiscribe-lockup-dark.svg">
+    <img src="assets/logo/tuiscribe-lockup.svg" alt="tuiscribe" width="356">
   </picture>
-</p>
-
-# tuiscribe
+</h1>
 
 Live meeting transcription in the terminal, for Linux with PipeWire.
 
