@@ -77,6 +77,45 @@ class SourcePicker(ModalScreen[Device | None]):
         self.dismiss(None)
 
 
+class DiarizePicker(ModalScreen[str | None]):
+    """Switch speaker labels on or off for one input. Returns the channel, or None."""
+
+    DEFAULT_CSS = MODAL_CSS.format(name="DiarizePicker")
+    BINDINGS = [Binding("escape", "dismiss(None)", "cancel")]
+
+    def __init__(self, channels: list[str], enabled: set[str], saved_audio: set[str]) -> None:
+        super().__init__()
+        self.channels = channels
+        self.enabled = enabled
+        self.saved_audio = saved_audio
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label("Speaker labels: tell apart voices within an input")
+            options = []
+            for ch in self.channels:
+                on = ch in self.enabled
+                t = Text()
+                t.append("● on   " if on else "○ off  ", "green" if on else "dim")
+                t.append(CHANNEL_LABELS[ch], "bold")
+                t.append("  Local 1, Local 2, ..." if ch == "mic" else "  Remote 1, Remote 2, ...", "dim")
+                if ch not in self.saved_audio:
+                    t.append("  audio not saved: from now only", "yellow")
+                options.append(Option(t, id=ch))
+            yield OptionList(*options)
+            yield Static(
+                "enter: switch on/off · esc: cancel\n"
+                "Inputs that are on when you stop are labelled for the whole session from the saved audio.",
+                classes="hint",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one(OptionList).focus()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(event.option.id)
+
+
 class NoteInput(ModalScreen[str | None]):
     DEFAULT_CSS = MODAL_CSS.format(name="NoteInput")
     BINDINGS = [Binding("escape", "dismiss(None)", "cancel")]
@@ -99,6 +138,7 @@ HELP = [
     ("M / S", "mute or unmute mic / system (muted audio is not transcribed)"),
     ("space", "pause or resume transcription (meters keep running)"),
     ("n", "insert a note or heading into the transcript"),
+    ("d", "speaker labels on/off per input (e.g. several people on one mic)"),
     ("?", "this help"),
     ("q / ctrl+c", "stop: transcribe remaining speech, write footer, exit"),
 ]

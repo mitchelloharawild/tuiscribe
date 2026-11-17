@@ -53,3 +53,43 @@ class AlignedWavWriter:
             if self._wav is not None:
                 self._wav.close()
                 self._wav = None
+
+
+class WavSpans:
+    """Reads stretches of saved WAVs by session time without loading whole files.
+
+    Only the format `AlignedWavWriter` writes (16 kHz mono 16-bit) is read; other
+    files give None, as does a channel with no file. Call `close()` when done.
+    """
+
+    def __init__(self, paths: dict[str, Path]) -> None:
+        self._wavs: dict[str, wave.Wave_read] = {}
+        for ch, path in paths.items():
+            try:
+                w = wave.open(str(path), "rb")
+            except (OSError, EOFError, wave.Error):
+                continue
+            if (w.getnchannels(), w.getsampwidth(), w.getframerate()) == (1, 2, SAMPLE_RATE):
+                self._wavs[ch] = w
+            else:
+                w.close()
+
+    @property
+    def channels(self) -> set[str]:
+        return set(self._wavs)
+
+    def __call__(self, channel: str, start: float, end: float) -> np.ndarray | None:
+        w = self._wavs.get(channel)
+        if w is None:
+            return None
+        a = max(0, int(round(start * SAMPLE_RATE)))
+        b = min(w.getnframes(), int(round(end * SAMPLE_RATE)))
+        if b <= a:
+            return None
+        w.setpos(a)
+        return np.frombuffer(w.readframes(b - a), dtype=np.int16).astype(np.float32) / 32768.0
+
+    def close(self) -> None:
+        for w in self._wavs.values():
+            w.close()
+        self._wavs.clear()

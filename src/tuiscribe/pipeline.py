@@ -310,17 +310,22 @@ class Pipeline:
     # --- speakers (STT thread) ----------------------------------------------------
 
     def _load_diarizer(self) -> None:
-        if self.diarizer is None:
+        # Only when a channel is diarized from the start; switching one on later
+        # loads the model then (Controller).
+        if self.diarizer is None or not self.diarizer.channels:
             return
         try:
             self.diarizer.load()
             self.bus.publish(StatusEvent("info", f"speaker labels on for {', '.join(sorted(self.diarizer.channels))}"))
         except Exception as e:  # noqa: BLE001 - transcription goes on without speaker labels
             self.bus.publish(StatusEvent("warning", f"speaker labels off: could not load the speaker model: {e}"))
-            self.diarizer = None
+            for ch in list(self.diarizer.channels):
+                self.diarizer.set_enabled(ch, False)
 
     def _speaker(self, channel: str, start: float, audio: np.ndarray, duration: float) -> str | None:
-        if self.diarizer is None or not self.diarizer.applies(channel):
+        # Not ready yet (model still loading after a switch-on): no live label;
+        # the end-of-session pass labels it from the saved audio.
+        if self.diarizer is None or not self.diarizer.ready or not self.diarizer.applies(channel):
             return None
         try:
             return self.diarizer.label((channel, start), audio, duration)

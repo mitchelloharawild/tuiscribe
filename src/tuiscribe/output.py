@@ -69,7 +69,12 @@ class TranscriptWriter:
                 self.segments += 1
             return md
 
-    def relabel(self, speakers: dict[tuple[str, float], str]) -> int:
+    def session_segments(self) -> list[Segment]:
+        """This session's segments so far, in file order."""
+        with self._lock:
+            return [r for r in self._session if isinstance(r, Segment)]
+
+    def relabel(self, speakers: dict[tuple[str, float], str | None]) -> int:
         """Set `speaker` on this session's segments, keyed by (channel, start), and
         rewrite the session in both files. Returns the number of segments changed."""
         with self._lock:

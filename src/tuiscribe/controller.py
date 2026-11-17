@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from .audio.wav import AlignedWavWriter
+from .audio.wav import AlignedWavWriter, WavSpans
 from .capture.devices import Device
 from .capture.levels import LevelAccumulator
 from .capture.pw_record import PwRecordSource
@@ -27,6 +27,7 @@ from .events import (
     EventBus,
     LevelEvent,
     Quit,
+    SetDiarize,
     SetMute,
     SetPause,
     SourceEvent,
@@ -55,7 +56,7 @@ class Controller:
         audio_paths: dict[str, Path] | None = None,  # channel -> .wav to write
         partials: bool = True,
         bus: EventBus | None = None,
-        diarizer: Diarizer | None = None,  # speaker labels within channels
+        diarizer: Diarizer | None = None,  # speaker labels within channels (switchable live)
     ) -> None:
         self.bus = bus or EventBus()
         self.devices = dict(devices)
@@ -161,12 +162,31 @@ class Controller:
         if self.pipeline is None or self.writer is None:
             return
         try:
-            self.relabelled = self.writer.relabel(self.pipeline.final_speakers())
+            speakers = self.pipeline.final_speakers() if self.diarizer is None else self._final_speakers()
+            self.relabelled = self.writer.relabel(speakers)
         except Exception as e:  # noqa: BLE001 - keep the live labels; still write the footer
             self.bus.publish(StatusEvent("error", f"could not update speaker labels: {e}"))
             return
         if self.relabelled:
             self.bus.publish(StatusEvent("info", f"speaker labels revised for {self.relabelled} segments"))
+
+    def _final_speakers(self) -> dict[tuple[str, float], str | None]:
+        """Whichever channels are diarized when the session stops get labels for the
+        whole session: segments from before they were switched on are embedded from
+        the saved audio. Channels switched off again lose their labels."""
+        d = self.diarizer
+        assert d is not None and self.writer is not None
+        segs = self.writer.session_segments()
+        spans = WavSpans({ch: p for ch, p in self.audio_paths.items() if ch in d.channels})
+        try:
+            todo = d.missing([s for s in segs if s.channel in spans.channels])
+            if todo:
+                self.bus.publish(StatusEvent("info", f"labelling speakers in {todo} earlier segments from the saved audio…"))
+                d.load()
+            labels = d.final_labels(segs, spans)
+        finally:
+            spans.close()
+        return {(s.channel, s.start): labels.get((s.channel, s.start)) for s in segs}
 
     def elapsed(self) -> float:
         return time.monotonic() - self.session_start if self.session_start else 0.0
@@ -195,6 +215,8 @@ class Controller:
                     if new and self.pipeline is not None:
                         self.pipeline.flush()
                     self.bus.publish(StatusEvent("info", "transcription paused" if new else "transcription resumed"))
+                case SetDiarize(channel, on):
+                    self._set_diarize(channel, on)
                 case AddNote(text):
                     if self.pipeline is None:
                         self.bus.publish(StatusEvent("warning", "notes need transcription enabled"))
@@ -202,6 +224,37 @@ class Controller:
                         self.pipeline.add_note(text)
                 case Quit():
                     pass  # the caller runs stop(), which can block while STT drains
+
+    def _set_diarize(self, channel: str, on: bool | None) -> None:
+        d = self.diarizer
+        label = CHANNEL_LABELS[channel]
+        if d is None or self.pipeline is None:
+            self.bus.publish(StatusEvent("warning", "speaker labels need transcription enabled"))
+            return
+        new = (not d.applies(channel)) if on is None else on
+        if new == d.applies(channel):
+            return
+        d.set_enabled(channel, new)
+        if not new:
+            self.bus.publish(StatusEvent("info", f"{label} speaker labels off (none in the transcript for {label})", channel))
+            return
+        if channel in self.audio_paths:
+            msg = f"{label} speaker labels on; earlier {label} speech is labelled when you stop"
+        else:
+            msg = f"{label} speaker labels on from now (audio not saved, so earlier speech stays unlabelled)"
+        self.bus.publish(StatusEvent("info", msg, channel))
+        if not d.ready:
+            threading.Thread(target=self._load_diarizer, args=(channel,), name="speaker-model", daemon=True).start()
+
+    def _load_diarizer(self, channel: str) -> None:
+        d = self.diarizer
+        assert d is not None
+        try:
+            d.load()
+        except Exception as e:  # noqa: BLE001 - transcription goes on without speaker labels
+            for ch in list(d.channels):
+                d.set_enabled(ch, False)
+            self.bus.publish(StatusEvent("warning", f"speaker labels off: could not load the speaker model: {e}", channel))
 
     def _switch(self, channel: str, device: Device) -> None:
         # Slow (stops and starts pw-record), so it has its own lock and does not

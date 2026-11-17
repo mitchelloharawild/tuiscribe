@@ -22,9 +22,19 @@ from textual.widgets import Footer, RichLog, Static
 from ..capture.devices import Device
 from ..config import CHANNEL_LABELS
 from ..controller import Controller
-from ..events import AddNote, FinalEvent, PartialEvent, SetMute, SetPause, SourceEvent, StatusEvent, SwitchSource
+from ..events import (
+    AddNote,
+    FinalEvent,
+    PartialEvent,
+    SetDiarize,
+    SetMute,
+    SetPause,
+    SourceEvent,
+    StatusEvent,
+    SwitchSource,
+)
 from .meters import FRAME_S, Meter
-from .screens import HelpScreen, NoteInput, SourcePicker
+from .screens import DiarizePicker, HelpScreen, NoteInput, SourcePicker
 from .transcript import TranscriptView
 
 
@@ -49,6 +59,7 @@ class TuiscribeApp(App):
         Binding("S", "toggle_mute('system')", "mute sys"),
         Binding("space", "toggle_pause", "pause"),
         Binding("n", "note", "note"),
+        Binding("d", "diarize", "speakers"),
         Binding("question_mark", "help", "help"),
         Binding("q", "quit_clean", "quit"),
         Binding("ctrl+c", "quit_clean", "quit", show=False, priority=True),
@@ -164,8 +175,8 @@ class TuiscribeApp(App):
                 if st.latency is not None:
                     parts.append(f"latency {st.latency:.1f} s")
                 parts.append(f"{st.segments} segments")
-                d = self.controller.pipeline.diarizer if self.controller.pipeline else None
-                if d is not None:
+                d = self.controller.diarizer
+                if d is not None and d.channels:
                     parts.append(", ".join(f"{CHANNEL_LABELS[ch].lower()} {d.speakers(ch)} spk" for ch in sorted(d.channels)))
             if st.dropped_chunks:
                 parts.append(f"dropped {st.dropped_chunks} chunks")
@@ -228,6 +239,18 @@ class TuiscribeApp(App):
                 self._log("info", f"note queued: {text}")
 
         self.push_screen(NoteInput(), done)
+
+    def action_diarize(self) -> None:
+        c = self.controller
+        if c.pipeline is None or c.diarizer is None or self._finishing:
+            self._log("warning", "Speaker labels need transcription enabled.")
+            return
+
+        def chosen(channel: str | None) -> None:
+            if channel is not None and not self._finishing:
+                c.apply(SetDiarize(channel))
+
+        self.push_screen(DiarizePicker(c.channels, set(c.diarizer.channels), set(c.audio_paths)), chosen)
 
     def action_help(self) -> None:
         self.push_screen(HelpScreen())

@@ -7,7 +7,7 @@ import os
 import signal
 import sys
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Annotated
@@ -18,7 +18,7 @@ from .capture.devices import Device, DeviceError, list_devices, resolve
 from .config import CHANNEL_LABELS, CHANNELS
 from .controller import Controller
 from .events import FinalEvent, PartialEvent, SourceEvent, StatusEvent
-from .records import Header, Note, Segment, from_json
+from .records import Header, Note, Segment, from_json, to_json
 from .render import RenderOptions, fmt_clock, render_records
 
 app = typer.Typer(
@@ -67,8 +67,10 @@ def _diarize_channels(values: list[str] | None, available: list[str]) -> list[st
     return [ch for ch in wanted if ch in available]
 
 
-def _make_diarizer(channels: list[str], threshold: float):
-    if not channels:
+def _make_diarizer(channels: list[str], threshold: float, always: bool = False):
+    """A Diarizer for `channels`, or None if there are none (unless `always`: the
+    TUI can switch channels on later)."""
+    if not channels and not always:
         return None
     from .diarize import Diarizer
 
@@ -160,7 +162,7 @@ def record(
         render_opts=RenderOptions(gap_short=gap_short, gap_long=gap_long),
         audio_paths=_audio_paths(output, list(chosen), started) if save_audio else None,
         partials=not no_partials,
-        diarizer=_make_diarizer(diarize_chans, speaker_threshold),
+        diarizer=None if no_transcribe else _make_diarizer(diarize_chans, speaker_threshold, always=True),
     )
     if no_tui or not sys.stdout.isatty():
         _run_plain(controller, duration)
@@ -252,6 +254,90 @@ def render(
     else:
         output.write_text(md, encoding="utf-8")
         typer.echo(f"wrote {output}")
+
+
+@app.command()
+def diarize(
+    transcript: Annotated[Path, typer.Argument(help="A transcript .md (or its .jsonl sidecar).")],
+    inputs: Annotated[list[str], typer.Option("--diarize", "-d", metavar="INPUTS", help="Inputs to label: mic, system or all (comma-separated or repeated).")],
+    audio: Annotated[list[str] | None, typer.Option("--audio", metavar="CH=FILE", help="Audio for an input, e.g. mic=talk.wav. Default: the <transcript>.mic.wav / .system.wav saved by record.")] = None,
+    output: Annotated[Path | None, typer.Option("-o", "--output", help="Markdown file to write, with its .jsonl next to it. Default: rewrite the transcript in place.")] = None,
+    speaker_threshold: SpeakerThresholdOpt = 0.5,
+    gap_short: GapShortOpt = 2.0,
+    gap_long: GapLongOpt = 10.0,
+) -> None:
+    """Add speaker labels to an existing transcript from its saved audio, without re-transcribing."""
+    from .audio.decode import load_audio
+    from .audio.wav import WavSpans
+    from .config import SAMPLE_RATE
+    from .output import sidecar_path
+
+    md_path = transcript.with_suffix(".md")
+    jsonl = sidecar_path(md_path)
+    try:
+        records = [from_json(line) for line in jsonl.read_text(encoding="utf-8").splitlines() if line.strip()]
+    except (OSError, ValueError, TypeError) as e:
+        raise typer.Exit(_fail(f"cannot read {jsonl}: {e}"))
+    sessions = sum(isinstance(r, Header) for r in records)
+    if sessions != 1:
+        raise typer.Exit(_fail(f"{jsonl.name} holds {sessions} sessions; diarize works on single-session transcripts"))
+    segs = [r for r in records if isinstance(r, Segment)]
+    present = sorted({s.channel for s in segs})
+    chans = _diarize_channels(inputs, present)
+    if not chans:
+        raise typer.Exit(_fail(f"nothing to label: the transcript has {', '.join(present) or 'no'} segments"))
+
+    opts = RenderOptions(gap_short=gap_short, gap_long=gap_long)
+    if output is None and md_path.exists() and md_path.read_text(encoding="utf-8") != render_records(records, opts):
+        raise typer.Exit(_fail(f"{md_path} differs from {jsonl.name} (edited by hand?); use -o to write a new file"))
+
+    files: dict[str, Path] = {ch: md_path.with_name(f"{md_path.stem}.{ch}.wav") for ch in chans}
+    for spec in audio or []:
+        ch, sep, path = spec.partition("=")
+        ch = CHANNEL_ALIASES.get(ch.strip().lower(), "")
+        if not sep or not ch:
+            raise typer.Exit(_fail(f"--audio {spec}: use mic=FILE or system=FILE"))
+        files[ch] = Path(path)
+    for ch in chans:
+        if not files[ch].exists():
+            raise typer.Exit(_fail(f"no audio for {ch}: {files[ch]} not found (use --audio {ch}=FILE)"))
+
+    spans = WavSpans({ch: files[ch] for ch in chans})
+    decoded: dict = {}  # channel -> whole decoded file (16 kHz float32)
+    for ch in chans:
+        if ch not in spans.channels:  # not a 16 kHz mono 16-bit WAV: decode it whole
+            try:
+                decoded[ch] = load_audio(files[ch])
+            except RuntimeError as e:
+                raise typer.Exit(_fail(str(e)))
+
+    def clip(ch: str, start: float, end: float):
+        if ch in decoded:
+            a = decoded[ch][int(start * SAMPLE_RATE) : int(end * SAMPLE_RATE)]
+            return a if len(a) else None
+        return spans(ch, start, end)
+
+    diarizer = _make_diarizer(chans, speaker_threshold)
+    typer.echo("loading speaker model ...")
+    diarizer.load()
+    todo = [s for s in segs if s.channel in chans]
+    typer.echo(f"labelling {len(todo)} segments ({', '.join(f'{CHANNEL_LABELS[ch]} {files[ch]}' for ch in chans)}) ...")
+    try:
+        labels = diarizer.final_labels(todo, clip)
+    finally:
+        spans.close()
+    records = [
+        replace(r, speaker=labels.get((r.channel, r.start))) if isinstance(r, Segment) and r.channel in chans else r
+        for r in records
+    ]
+    out_md = output or md_path
+    out_md.parent.mkdir(parents=True, exist_ok=True)
+    sidecar_path(out_md).write_text("".join(to_json(r) + "\n" for r in records), encoding="utf-8")
+    out_md.write_text(render_records(records, opts), encoding="utf-8")
+    for ch in chans:
+        n = len({labels[k] for k in labels if k[0] == ch})
+        typer.echo(f"{CHANNEL_LABELS[ch]}: {n} speaker{'s' if n != 1 else ''}")
+    typer.echo(f"wrote {out_md} (+ {sidecar_path(out_md).name})")
 
 
 # --- plain (--no-tui) mode ---------------------------------------------------

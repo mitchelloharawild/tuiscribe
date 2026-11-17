@@ -90,11 +90,19 @@ class AddNote:
 
 
 @dataclass(frozen=True)
+class SetDiarize:
+    """Label separate speakers within a channel (applies to the whole session at stop)."""
+
+    channel: str
+    on: bool | None = None  # None toggles
+
+
+@dataclass(frozen=True)
 class Quit:
     pass
 
 
-Command = SetMute | SwitchSource | SetPause | AddNote | Quit
+Command = SetMute | SwitchSource | SetPause | AddNote | SetDiarize | Quit
 
 
 # --- bus --------------------------------------------------------------------

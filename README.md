@@ -51,6 +51,7 @@ tuiscribe record -o standup.md --diarize system
 | `M` / `S` | mute or unmute it |
 | `space` | pause or resume |
 | `n` | add a note or heading |
+| `d` | speaker labels on or off for an input |
 | `q` | stop: finishes the last utterances, then exits |
 
 Other commands:
@@ -58,6 +59,7 @@ Other commands:
 ```sh
 tuiscribe replay mic=standup.mic.wav system=standup.system.wav -o redo.md --model medium.en
 tuiscribe render standup.jsonl -o standup.md     # rebuild the Markdown from the .jsonl sidecar
+tuiscribe diarize standup.md --diarize mic       # add speaker labels afterwards, from the saved audio
 ```
 
 See `tuiscribe record --help` for all options: the model, the inputs to record,
@@ -77,10 +79,22 @@ Yes, that's fine. Go ahead.
 
 ## Speaker labels (prototype)
 
-`--diarize system` (or `mic`, or `all`) gives each utterance a voiceprint from a
-small speaker model (3D-Speaker CAM++, 28 MB, cached in `~/.cache/tuiscribe/models`).
+Speaker labels tell apart voices *within* one input: several people on a call
+(`system`: Remote 1, Remote 2, ...) or in the room with you (`mic`: Local 1,
+Local 2, ...). Each utterance gets a voiceprint from a small speaker model
+(3D-Speaker CAM++, 28 MB, cached in `~/.cache/tuiscribe/models`).
+
+- `--diarize system` (or `mic`, or `all`) switches them on from the start.
+- `d` in the TUI switches them on or off for an input during the session.
+- `tuiscribe diarize` adds them to a finished transcript, from its saved audio,
+  without transcribing again. It rewrites the transcript in place, or writes to
+  `-o` (required if you have edited the `.md` by hand).
+
 Speakers are labelled live. When you stop, the whole session is grouped again and
-the transcript is rewritten with the corrected labels.
+the transcript is rewritten with the corrected labels. An input that is on at that
+point is labelled for the whole session, including speech from before you
+switched it on (this uses the saved audio, so not with `--no-save-audio`). An
+input switched off again gets no labels.
 
 The labels are numbers, not names. A very short utterance ("yeah") takes the
 nearest or the previous speaker. If one person is split into two speakers, lower

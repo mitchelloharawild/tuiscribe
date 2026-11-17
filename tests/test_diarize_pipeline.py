@@ -98,7 +98,7 @@ def test_diarizer_load_failure_warns_and_continues(tmp_path):
     assert any("speaker labels off" in e.message and "no onnx" in e.message for e in warns)
     assert not statuses(events, "error")
     assert len(segs) == 3 and all(s.speaker is None for s in segs)
-    assert p.diarizer is None
+    assert not d.channels  # switched off, kept so the TUI can try again
     assert p.final_speakers() == {}
 
 
