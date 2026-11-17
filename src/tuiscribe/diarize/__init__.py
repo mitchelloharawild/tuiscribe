@@ -7,6 +7,9 @@ clustering. Channels can be switched on and off during a session. When the
 session ends, `final_labels()` re-clusters the whole session at once. Segments
 that were never embedded live (said before the channel was switched on) are
 embedded then from the saved audio, so the labels cover the whole session.
+
+With a `VoiceBank` of known voices, a group that clearly sounds like a saved
+person is labelled with their name instead of "Local N" (see `voices`).
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ import numpy as np
 from ..records import Segment
 from .cluster import DEFAULT_THRESHOLD, OnlineClusterer, cluster_all
 from .embed import DEFAULT_MODEL, SpeakerEmbedder
+from .voices import VoiceBank, centroid_of
 
 # Label stem per channel when it is diarized. The mic may hear several people
 # in the room, so its speakers are "Local N" rather than "You".
@@ -39,9 +43,15 @@ class Diarizer:
         channels: Iterable[str] = (),
         embedder: SpeakerEmbedder | None = None,
         threshold: float = DEFAULT_THRESHOLD,
+        voices: VoiceBank | None = None,
     ) -> None:
         self.embedder = embedder or SpeakerEmbedder(DEFAULT_MODEL)
         self.threshold = threshold
+        self.voices = voices
+        # set by final_labels: channel -> label -> that group's (key, embedding, duration)
+        self.groups: dict[str, dict[str, list[tuple[Key, np.ndarray | None, float]]]] = {}
+        # channel -> label -> similarity, for labels that came from a known voice
+        self.matched: dict[str, dict[str, float]] = {}
         self.channels: set[str] = set()
         self.ready = False  # model loaded
         self._lock = threading.Lock()
@@ -123,6 +133,36 @@ class Diarizer:
             if not entries:
                 continue
             labels = cluster_all([e for _, e, _ in entries], [d for _, _, d in entries], self.threshold)
-            for (key, _, _), k in zip(entries, labels):
-                out[key] = speaker_label(ch, k)
+            names, scores = self._names(ch, entries, labels)
+            self.groups[ch] = {}
+            self.matched[ch] = scores
+            for entry, k in zip(entries, labels):
+                out[entry[0]] = names[k]
+                self.groups[ch].setdefault(names[k], []).append(entry)
         return out
+
+    def _names(
+        self, ch: str, entries: list[tuple[Key, np.ndarray | None, float]], labels: list[int]
+    ) -> tuple[dict[int, str], dict[str, float]]:
+        """Label per group: a known voice's name if it clearly matches, else
+        "Local N" numbered by first appearance among the unnamed groups."""
+        matched: dict = {}
+        if self.voices:
+            cents = {}
+            for k in sorted(set(labels)):
+                members = [(e, d) for (_, e, d), lab in zip(entries, labels) if lab == k]
+                c = centroid_of([e for e, _ in members], [d for _, d in members])
+                if c is not None:
+                    cents[k] = c
+            matched = self.voices.match(cents, ch)
+        names: dict[int, str] = {}
+        n = 0
+        for k in labels:  # first-appearance order
+            if k in names:
+                continue
+            if k in matched:
+                names[k] = matched[k][0]
+            else:
+                names[k] = speaker_label(ch, n)
+                n += 1
+        return names, {name: score for name, score in matched.values()}

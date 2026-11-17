@@ -43,6 +43,10 @@ SpeakerThresholdOpt = Annotated[
     float,
     typer.Option(help="Voice similarity (0-1) needed to count as the same speaker. Lower merges more voices."),
 ]
+VoicesOpt = Annotated[
+    bool,
+    typer.Option("--voices/--no-voices", help="Name speakers who match a saved voice (see `tuiscribe voices`)."),
+]
 CHANNEL_ALIASES = {"mic": "mic", "microphone": "mic", "system": "system", "sys": "system"}
 
 
@@ -67,14 +71,18 @@ def _diarize_channels(values: list[str] | None, available: list[str]) -> list[st
     return [ch for ch in wanted if ch in available]
 
 
-def _make_diarizer(channels: list[str], threshold: float, always: bool = False):
+def _make_diarizer(channels: list[str], threshold: float, always: bool = False, voices: bool = True):
     """A Diarizer for `channels`, or None if there are none (unless `always`: the
-    TUI can switch channels on later)."""
+    TUI can switch channels on later). With `voices`, it names known speakers."""
     if not channels and not always:
         return None
     from .diarize import Diarizer
+    from .diarize.voices import VoiceBank
 
-    return Diarizer(channels, threshold=threshold)
+    bank = VoiceBank() if voices else None
+    for path in bank.unreadable if bank else []:
+        typer.secho(f"warning: skipping unreadable voice file {path}", fg="yellow", err=True)
+    return Diarizer(channels, threshold=threshold, voices=bank)
 
 
 def _default_output(started: datetime) -> Path:
@@ -129,6 +137,7 @@ def record(
     gap_long: GapLongOpt = 10.0,
     diarize: DiarizeOpt = None,
     speaker_threshold: SpeakerThresholdOpt = 0.5,
+    voices: VoicesOpt = True,
     save_audio: Annotated[bool, typer.Option("--save-audio/--no-save-audio", help="Keep time-aligned <transcript>.mic.wav / .system.wav next to the transcript.")] = True,
     duration: Annotated[float | None, typer.Option(help="Stop after this many seconds.")] = None,
     no_tui: Annotated[bool, typer.Option("--no-tui", help="Plain log output instead of the interactive display.")] = False,
@@ -162,7 +171,7 @@ def record(
         render_opts=RenderOptions(gap_short=gap_short, gap_long=gap_long),
         audio_paths=_audio_paths(output, list(chosen), started) if save_audio else None,
         partials=not no_partials,
-        diarizer=None if no_transcribe else _make_diarizer(diarize_chans, speaker_threshold, always=True),
+        diarizer=None if no_transcribe else _make_diarizer(diarize_chans, speaker_threshold, always=True, voices=voices),
     )
     if no_tui or not sys.stdout.isatty():
         _run_plain(controller, duration)
@@ -186,6 +195,7 @@ def replay(
     gap_long: GapLongOpt = 10.0,
     diarize: DiarizeOpt = None,
     speaker_threshold: SpeakerThresholdOpt = 0.5,
+    voices: VoicesOpt = True,
 ) -> None:
     """Run the transcription pipeline on recorded audio (e.g. the saved .wav files)."""
     from .audio.decode import load_audio
@@ -208,7 +218,7 @@ def replay(
         names[ch] = Path(path).name
         typer.echo(f"{CHANNEL_LABELS[ch]:<7} {path} ({len(audio[ch]) / 16000:.1f} s)")
 
-    diarizer = _make_diarizer(_diarize_channels(diarize, list(audio)), speaker_threshold)
+    diarizer = _make_diarizer(_diarize_channels(diarize, list(audio)), speaker_threshold, voices=voices)
     for p in (output, sidecar_path(output)):
         p.unlink(missing_ok=True)
     tr = FasterWhisperTranscriber(model)
@@ -256,20 +266,15 @@ def render(
         typer.echo(f"wrote {output}")
 
 
-@app.command()
-def diarize(
-    transcript: Annotated[Path, typer.Argument(help="A transcript .md (or its .jsonl sidecar).")],
-    inputs: Annotated[list[str], typer.Option("--diarize", "-d", metavar="INPUTS", help="Inputs to label: mic, system or all (comma-separated or repeated).")],
-    audio: Annotated[list[str] | None, typer.Option("--audio", metavar="CH=FILE", help="Audio for an input, e.g. mic=talk.wav. Default: the <transcript>.mic.wav / .system.wav saved by record.")] = None,
-    output: Annotated[Path | None, typer.Option("-o", "--output", help="Markdown file to write, with its .jsonl next to it. Default: rewrite the transcript in place.")] = None,
-    speaker_threshold: SpeakerThresholdOpt = 0.5,
-    gap_short: GapShortOpt = 2.0,
-    gap_long: GapLongOpt = 10.0,
-) -> None:
-    """Add speaker labels to an existing transcript from its saved audio, without re-transcribing."""
-    from .audio.decode import load_audio
-    from .audio.wav import WavSpans
-    from .config import SAMPLE_RATE
+AudioOpt = Annotated[
+    list[str] | None,
+    typer.Option("--audio", metavar="CH=FILE", help="Audio for an input, e.g. mic=talk.wav. Default: the <transcript>.mic.wav / .system.wav saved by record."),
+]
+OutputOpt = Annotated[Path | None, typer.Option("-o", "--output", help="Markdown file to write, with its .jsonl next to it. Default: rewrite the transcript in place.")]
+
+
+def _read_session(transcript: Path) -> tuple[Path, list]:
+    """The transcript's .md path and its sidecar records (one session only)."""
     from .output import sidecar_path
 
     md_path = transcript.with_suffix(".md")
@@ -280,16 +285,29 @@ def diarize(
         raise typer.Exit(_fail(f"cannot read {jsonl}: {e}"))
     sessions = sum(isinstance(r, Header) for r in records)
     if sessions != 1:
-        raise typer.Exit(_fail(f"{jsonl.name} holds {sessions} sessions; diarize works on single-session transcripts"))
-    segs = [r for r in records if isinstance(r, Segment)]
-    present = sorted({s.channel for s in segs})
-    chans = _diarize_channels(inputs, present)
-    if not chans:
-        raise typer.Exit(_fail(f"nothing to label: the transcript has {', '.join(present) or 'no'} segments"))
+        raise typer.Exit(_fail(f"{jsonl.name} holds {sessions} sessions; this works on single-session transcripts"))
+    return md_path, records
 
-    opts = RenderOptions(gap_short=gap_short, gap_long=gap_long)
-    if output is None and md_path.exists() and md_path.read_text(encoding="utf-8") != render_records(records, opts):
-        raise typer.Exit(_fail(f"{md_path} differs from {jsonl.name} (edited by hand?); use -o to write a new file"))
+
+def _in_place_ok(md_path: Path, records: list, opts: RenderOptions) -> bool:
+    """Rewriting `md_path` from the sidecar would not lose hand edits."""
+    return not md_path.exists() or md_path.read_text(encoding="utf-8") == render_records(records, opts)
+
+
+def _write_session(out_md: Path, records: list, opts: RenderOptions) -> None:
+    from .output import sidecar_path
+
+    out_md.parent.mkdir(parents=True, exist_ok=True)
+    sidecar_path(out_md).write_text("".join(to_json(r) + "\n" for r in records), encoding="utf-8")
+    out_md.write_text(render_records(records, opts), encoding="utf-8")
+
+
+def _session_audio(md_path: Path, chans: list[str], audio: list[str] | None):
+    """(ch, start, end) -> audio for each of `chans`, from the saved WAVs or `--audio`
+    files, and a function that closes them. Exits if a file is missing."""
+    from .audio.decode import load_audio
+    from .audio.wav import WavSpans
+    from .config import SAMPLE_RATE
 
     files: dict[str, Path] = {ch: md_path.with_name(f"{md_path.stem}.{ch}.wav") for ch in chans}
     for spec in audio or []:
@@ -309,6 +327,7 @@ def diarize(
             try:
                 decoded[ch] = load_audio(files[ch])
             except RuntimeError as e:
+                spans.close()
                 raise typer.Exit(_fail(str(e)))
 
     def clip(ch: str, start: float, end: float):
@@ -317,7 +336,36 @@ def diarize(
             return a if len(a) else None
         return spans(ch, start, end)
 
-    diarizer = _make_diarizer(chans, speaker_threshold)
+    return clip, spans.close, files
+
+
+@app.command()
+def diarize(
+    transcript: Annotated[Path, typer.Argument(help="A transcript .md (or its .jsonl sidecar).")],
+    inputs: Annotated[list[str], typer.Option("--diarize", "-d", metavar="INPUTS", help="Inputs to label: mic, system or all (comma-separated or repeated).")],
+    audio: AudioOpt = None,
+    output: OutputOpt = None,
+    speaker_threshold: SpeakerThresholdOpt = 0.5,
+    voices: VoicesOpt = True,
+    gap_short: GapShortOpt = 2.0,
+    gap_long: GapLongOpt = 10.0,
+) -> None:
+    """Add speaker labels to an existing transcript from its saved audio, without re-transcribing."""
+    from .output import sidecar_path
+
+    md_path, records = _read_session(transcript)
+    segs = [r for r in records if isinstance(r, Segment)]
+    present = sorted({s.channel for s in segs})
+    chans = _diarize_channels(inputs, present)
+    if not chans:
+        raise typer.Exit(_fail(f"nothing to label: the transcript has {', '.join(present) or 'no'} segments"))
+
+    opts = RenderOptions(gap_short=gap_short, gap_long=gap_long)
+    if output is None and not _in_place_ok(md_path, records, opts):
+        raise typer.Exit(_fail(f"{md_path} differs from {sidecar_path(md_path).name} (edited by hand?); use -o to write a new file"))
+
+    clip, close, files = _session_audio(md_path, chans, audio)
+    diarizer = _make_diarizer(chans, speaker_threshold, voices=voices)
     typer.echo("loading speaker model ...")
     diarizer.load()
     todo = [s for s in segs if s.channel in chans]
@@ -325,19 +373,111 @@ def diarize(
     try:
         labels = diarizer.final_labels(todo, clip)
     finally:
-        spans.close()
+        close()
     records = [
         replace(r, speaker=labels.get((r.channel, r.start))) if isinstance(r, Segment) and r.channel in chans else r
         for r in records
     ]
     out_md = output or md_path
-    out_md.parent.mkdir(parents=True, exist_ok=True)
-    sidecar_path(out_md).write_text("".join(to_json(r) + "\n" for r in records), encoding="utf-8")
-    out_md.write_text(render_records(records, opts), encoding="utf-8")
+    _write_session(out_md, records, opts)
     for ch in chans:
-        n = len({labels[k] for k in labels if k[0] == ch})
-        typer.echo(f"{CHANNEL_LABELS[ch]}: {n} speaker{'s' if n != 1 else ''}")
+        names = sorted({labels[k] for k in labels if k[0] == ch})
+        known = diarizer.matched.get(ch, {})
+        detail = ", ".join(f"{n} ({known[n]:.2f})" for n in names if n in known)
+        typer.echo(f"{CHANNEL_LABELS[ch]}: {len(names)} speaker{'s' if len(names) != 1 else ''}" + (f"; known: {detail}" if detail else ""))
     typer.echo(f"wrote {out_md} (+ {sidecar_path(out_md).name})")
+
+
+# --- known voices ------------------------------------------------------------
+
+voices_app = typer.Typer(
+    help="Voices of known speakers, used to name them in transcripts instead of Local 1, Remote 1, ...",
+    no_args_is_help=True,
+)
+app.add_typer(voices_app, name="voices")
+
+
+@voices_app.command("list")
+def voices_list() -> None:
+    """List saved voices."""
+    from .diarize.voices import VoiceBank
+
+    bank = VoiceBank()
+    if not bank.voices:
+        typer.echo(f"no saved voices in {bank.dir}")
+        return
+    for name, v in sorted(bank.voices.items()):
+        inputs = ", ".join(f"{CHANNEL_LABELS.get(ch, ch)} {v.duration[v.channel == ch].sum() / 60:.1f} min" for ch in sorted(set(v.channel)))
+        last = datetime.fromtimestamp(float(v.added.max())).strftime("%Y-%m-%d") if len(v) else "-"
+        line = f"{name}: {len(v)} samples from {len(set(v.source))} transcript{'s' if len(set(v.source)) != 1 else ''} ({inputs}); last added {last}"
+        if v.model != bank.model:
+            line += f"  [saved with the {v.model} model: not used]"
+        typer.echo(line)
+    for path in bank.unreadable:
+        typer.secho(f"unreadable: {path}", fg="yellow")
+    typer.echo(f"({bank.dir})")
+
+
+@voices_app.command("add")
+def voices_add(
+    name: Annotated[str, typer.Argument(help="The person's name, as it should appear in transcripts.")],
+    transcript: Annotated[Path, typer.Argument(help="A transcript .md (or .jsonl) where they are labelled.")],
+    label: Annotated[str | None, typer.Option("--label", "-l", help="Their label in that transcript, e.g. 'Local 1'. Default: NAME.")] = None,
+    audio: AudioOpt = None,
+    rename: Annotated[bool, typer.Option("--rename/--no-rename", help="Also relabel them as NAME in the transcript.")] = True,
+    gap_short: GapShortOpt = 2.0,
+    gap_long: GapLongOpt = 10.0,
+) -> None:
+    """Save someone's voice from a transcript where their label is right (check it first)."""
+    from .diarize import SpeakerEmbedder
+    from .diarize.voices import VoiceBank
+    from .output import sidecar_path
+
+    label = label or name
+    md_path, records = _read_session(transcript)
+    mine = [r for r in records if isinstance(r, Segment) and r.speaker == label]
+    if not mine:
+        found = sorted({r.speaker for r in records if isinstance(r, Segment) and r.speaker})
+        raise typer.Exit(_fail(f"no segments labelled '{label}' in {md_path.name} (labels: {', '.join(found) or 'none'})"))
+    chans = sorted({s.channel for s in mine})
+    clip, close, _ = _session_audio(md_path, chans, audio)
+    bank = VoiceBank()
+    emb = SpeakerEmbedder(bank.model)
+    typer.echo("loading speaker model ...")
+    emb.load()
+    added = 0
+    try:
+        for ch in chans:
+            samples = []
+            for s in (s for s in mine if s.channel == ch):
+                a = clip(ch, s.start, s.end)
+                samples.append((emb.embed(a) if a is not None else None, s.start, s.end))
+            try:
+                added += bank.add(name, samples, ch, str(md_path.resolve()))
+            except ValueError as e:
+                raise typer.Exit(_fail(str(e)))
+    finally:
+        close()
+    v = bank.get(name)
+    typer.echo(f"{name}: added {added} samples from {len(mine)} segments; {len(v) if v else 0} saved in all")
+    if rename and label != name:
+        opts = RenderOptions(gap_short=gap_short, gap_long=gap_long)
+        if not _in_place_ok(md_path, records, opts):
+            typer.secho(f"{md_path.name} differs from {sidecar_path(md_path).name} (edited by hand?), so it was not relabelled", fg="yellow")
+            return
+        records = [replace(r, speaker=name) if isinstance(r, Segment) and r.speaker == label else r for r in records]
+        _write_session(md_path, records, opts)
+        typer.echo(f"relabelled '{label}' as '{name}' in {md_path}")
+
+
+@voices_app.command("remove")
+def voices_remove(name: Annotated[str, typer.Argument(help="Whose voice to delete.")]) -> None:
+    """Delete a saved voice."""
+    from .diarize.voices import VoiceBank
+
+    if not VoiceBank().remove(name):
+        raise typer.Exit(_fail(f"no saved voice for '{name}'"))
+    typer.echo(f"removed {name}")
 
 
 # --- plain (--no-tui) mode ---------------------------------------------------

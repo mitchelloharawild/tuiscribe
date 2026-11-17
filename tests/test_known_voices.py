@@ -1,0 +1,99 @@
+"""Naming speakers from saved voices: Diarizer, `tuiscribe diarize`, `tuiscribe voices`."""
+
+import numpy as np
+from typer.testing import CliRunner
+
+from tuiscribe.cli import app
+from tuiscribe.diarize import Diarizer
+from tuiscribe.diarize.voices import VoiceBank
+from tuiscribe.output import sidecar_path
+from tuiscribe.records import Segment, from_json
+
+from test_diarize import A, B, AmpEmbedder, tone
+from test_diarize_toggle import fake_model, recorded  # noqa: F401 - fixture
+
+
+def speakers(md):
+    return [r.speaker for r in map(from_json, sidecar_path(md).read_text().splitlines()) if isinstance(r, Segment)]
+
+
+def bank_with(**people):
+    bank = VoiceBank()
+    for name, voice in people.items():
+        bank.add(name, [(voice, 0.0, 5.0), (voice, 10.0, 15.0)], "mic", "earlier.md")
+    return bank
+
+
+def test_final_labels_name_known_voices_and_renumber_the_rest():
+    d = Diarizer(["mic"], embedder=AmpEmbedder(), voices=bank_with(Bea=B))
+    for i, amp in enumerate([0.3, 0.6, 0.3]):
+        d.label(("mic", float(i)), tone(amp, 32000), 2.0)
+    labels = d.final_labels()
+    assert [labels[("mic", float(i))] for i in range(3)] == ["Local 1", "Bea", "Local 1"]
+    assert set(d.matched["mic"]) == {"Bea"} and d.matched["mic"]["Bea"] > 0.99
+    assert {k: len(v) for k, v in d.groups["mic"].items()} == {"Local 1": 2, "Bea": 1}
+
+
+def test_final_labels_without_voices_are_unchanged():
+    d = Diarizer(["mic"], embedder=AmpEmbedder(), voices=VoiceBank())  # empty bank
+    for i, amp in enumerate([0.6, 0.3]):
+        d.label(("mic", float(i)), tone(amp, 32000), 2.0)
+    assert list(d.final_labels().values()) == ["Local 1", "Local 2"]
+
+
+def test_cli_voices_add_then_diarize_names_them(tmp_path, fake_model):
+    md = recorded(tmp_path)
+    run = CliRunner().invoke
+    assert run(app, ["diarize", str(md), "-d", "mic"]).exit_code == 0
+    assert speakers(md) == ["Local 1", "Local 2", "Local 1"]
+
+    r = run(app, ["voices", "add", "Bea", str(md), "--label", "Local 2"])
+    assert r.exit_code == 0, r.output
+    assert "added 1 samples" in r.output and "relabelled 'Local 2' as 'Bea'" in r.output
+    assert speakers(md) == ["Local 1", "Bea", "Local 1"]
+    v = VoiceBank().get("Bea")
+    assert len(v) == 1 and v.source[0] == str(md.resolve()) and np.allclose(v.emb[0], B)
+
+    # a fresh labelling names her from the saved voice
+    out = tmp_path / "again.md"
+    r = run(app, ["diarize", str(md), "-d", "mic", "-o", str(out)])
+    assert r.exit_code == 0, r.output
+    assert "known: Bea (1.00)" in r.output
+    assert speakers(out) == ["Local 1", "Bea", "Local 1"]
+    r = run(app, ["diarize", str(md), "-d", "mic", "-o", str(out), "--no-voices"])
+    assert speakers(out) == ["Local 1", "Local 2", "Local 1"]
+
+    r = run(app, ["voices", "list"])
+    assert "Bea: 1 samples from 1 transcript (MIC 0.0 min)" in r.output
+    assert run(app, ["voices", "remove", "Bea"]).exit_code == 0
+    assert VoiceBank().get("Bea") is None
+    assert run(app, ["voices", "remove", "Bea"]).exit_code == 1
+
+
+def test_cli_voices_add_label_defaults_to_name_and_is_idempotent(tmp_path, fake_model):
+    md = recorded(tmp_path)
+    CliRunner().invoke(app, ["diarize", str(md), "-d", "mic"])
+    CliRunner().invoke(app, ["voices", "add", "Al", str(md), "-l", "Local 1"])
+    r = CliRunner().invoke(app, ["voices", "add", "Al", str(md)])  # now labelled Al
+    assert r.exit_code == 0 and "added 0 samples" in r.output and "2 saved in all" in r.output
+
+
+def test_cli_voices_add_unknown_label(tmp_path, fake_model):
+    md = recorded(tmp_path)
+    r = CliRunner().invoke(app, ["voices", "add", "Bea", str(md)])
+    assert r.exit_code == 1 and "no segments labelled 'Bea'" in r.output
+
+
+def test_cli_voices_add_keeps_hand_edits(tmp_path, fake_model):
+    md = recorded(tmp_path)
+    CliRunner().invoke(app, ["diarize", str(md), "-d", "mic"])
+    md.write_text(md.read_text() + "my edits\n")
+    r = CliRunner().invoke(app, ["voices", "add", "Bea", str(md), "-l", "Local 2"])
+    assert r.exit_code == 0 and "not relabelled" in r.output
+    assert "my edits" in md.read_text() and speakers(md)[1] == "Local 2"
+    assert VoiceBank().get("Bea") is not None
+
+
+def test_cli_voices_list_empty():
+    r = CliRunner().invoke(app, ["voices", "list"])
+    assert r.exit_code == 0 and "no saved voices" in r.output

@@ -60,6 +60,7 @@ Other commands:
 tuiscribe replay mic=standup.mic.wav system=standup.system.wav -o redo.md --model medium.en
 tuiscribe render standup.jsonl -o standup.md     # rebuild the Markdown from the .jsonl sidecar
 tuiscribe diarize standup.md --diarize mic       # add speaker labels afterwards, from the saved audio
+tuiscribe voices add Simon standup.md -l "Local 2"  # remember a voice, so later sessions name Simon
 ```
 
 See `tuiscribe record --help` for all options: the model, the inputs to record,
@@ -96,9 +97,32 @@ point is labelled for the whole session, including speech from before you
 switched it on (this uses the saved audio, so not with `--no-save-audio`). An
 input switched off again gets no labels.
 
-The labels are numbers, not names. A very short utterance ("yeah") takes the
-nearest or the previous speaker. If one person is split into two speakers, lower
-`--speaker-threshold`; if two people are merged into one, raise it.
+A very short utterance ("yeah") takes the nearest or the previous speaker. If one
+person is split into two speakers, lower `--speaker-threshold`; if two people are
+merged into one, raise it.
+
+### Known speakers
+
+Save someone's voice from a transcript where their label is right, and later
+sessions name them instead of numbering them:
+
+```sh
+tuiscribe voices add Simon standup.md --label "Local 2"   # also relabels Local 2 as Simon there
+tuiscribe voices list
+tuiscribe voices remove Simon
+```
+
+A speaker group is named when it clearly sounds like one saved person (and more
+like them than anyone else saved); each name is used for at most one group, and
+the rest stay numbered. Voices are only learned from labels you confirm, never
+from automatic matches. Adding more transcripts of the same person makes the match
+more reliable, especially across rooms and microphones: recordings from the same
+input (mic or system) are compared first, and newer ones count for more. Each
+person keeps up to 300 samples (the oldest are dropped).
+
+Voices are speaker embeddings (biometric data) and stay on this machine, in
+`~/.local/share/tuiscribe/voices` (or `$TUISCRIBE_VOICES_DIR`), one file per person.
+Ask people before saving theirs. `--no-voices` turns name matching off.
 
 ## Development
 
