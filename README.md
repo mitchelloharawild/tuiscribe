@@ -112,9 +112,10 @@ tuiscribe voices list
 tuiscribe voices remove Simon
 ```
 
-A speaker group is named when it clearly sounds like one saved person (and more
-like them than anyone else saved); each name is used for at most one group, and
-the rest stay numbered. Voices are only learned from labels you confirm, never
+Saved people are named live from their first clear utterance, and newcomers are
+numbered. When you stop, a speaker group is named when it clearly sounds like one
+saved person (and more like them than anyone else saved); each name is used for
+at most one group, and the rest stay numbered. Voices are only learned from labels you confirm, never
 from automatic matches. Adding more transcripts of the same person makes the match
 more reliable, especially across rooms and microphones: recordings from the same
 input (mic or system) are compared first, and newer ones count for more. Each

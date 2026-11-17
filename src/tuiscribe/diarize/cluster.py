@@ -4,51 +4,75 @@
   speaker if the similarity reaches `threshold`, otherwise it starts a new
   speaker. Short utterances give unreliable embeddings, so they never start
   or move a speaker: they join one only if clearly similar, else they keep
-  the previous label.
+  the previous label. It can start with `seeds` (known voices): these are
+  speakers 0..n-1, which an utterance joins only at `SEED_THRESHOLD` or more,
+  so an unknown voice is not taken for a known one.
 - `cluster_all`: average-linkage agglomerative clustering over a whole
   session, run once at the end to correct early live decisions.
 
-Both return speaker indices numbered by first appearance (0, 1, ...).
+`cluster_all` numbers speakers by first appearance (0, 1, ...); the online
+clusterer numbers new speakers after its seeds, in order of appearance.
 """
 
 from __future__ import annotations
+
+from collections.abc import Sequence
 
 import numpy as np
 
 DEFAULT_THRESHOLD = 0.5
 MIN_RELIABLE_S = 1.0
+SEED_THRESHOLD = 0.5  # similarity needed to join a known voice (at least `threshold`)
+SEED_SECONDS = 30.0  # weight of a known voice against this session's speech
 
 
 class OnlineClusterer:
-    def __init__(self, threshold: float = DEFAULT_THRESHOLD, min_reliable_s: float = MIN_RELIABLE_S) -> None:
+    def __init__(
+        self,
+        threshold: float = DEFAULT_THRESHOLD,
+        min_reliable_s: float = MIN_RELIABLE_S,
+        seeds: Sequence[np.ndarray] = (),
+    ) -> None:
         self.threshold = threshold
         self.min_reliable_s = min_reliable_s
-        self._sums: list[np.ndarray] = []  # duration-weighted sum of embeddings per speaker
+        self.n_seeds = len(seeds)
+        # duration-weighted sum of embeddings per speaker; seeds adapt to this session too
+        self._sums: list[np.ndarray] = [np.asarray(c, dtype=np.float64) * SEED_SECONDS for c in seeds]
+        self._secs: list[float] = [0.0] * len(seeds)  # this session's reliable speech per speaker
         self._last: int | None = None
 
     @property
     def n_speakers(self) -> int:
         return len(self._sums)
 
+    def centroid(self, k: int) -> np.ndarray:
+        return self._sums[k] / np.linalg.norm(self._sums[k])
+
+    def seconds(self, k: int) -> float:
+        """This session's reliable speech behind speaker `k`'s voiceprint."""
+        return self._secs[k]
+
     def assign(self, emb: np.ndarray | None, duration: float) -> int:
         reliable = emb is not None and duration >= self.min_reliable_s
-        if not self._sums:
-            # Nothing to compare with: label it speaker 0, but only a reliable
-            # embedding may found that speaker's voiceprint.
-            if reliable:
-                self._sums.append(emb * duration)
-            return self._remember(0)
+        fallback = self._last if self._last is not None else self.n_seeds  # first unknown speaker
         if emb is None:
-            return self._remember(self._last or 0)
-        cents = np.stack([s / np.linalg.norm(s) for s in self._sums])
-        sims = cents @ emb
-        best = int(sims.argmax())
-        if not reliable:
-            return self._remember(best if sims[best] >= self.threshold else (self._last or 0))
-        if sims[best] >= self.threshold:
-            self._sums[best] = self._sums[best] + emb * duration
-            return self._remember(best)
+            return self._remember(fallback)
+        if self._sums:
+            cents = np.stack([s / np.linalg.norm(s) for s in self._sums])
+            sims = cents @ emb
+            need = np.full(len(sims), self.threshold)
+            need[: self.n_seeds] = max(self.threshold, SEED_THRESHOLD)
+            sims = np.where(sims >= need, sims, -np.inf)
+            best = int(sims.argmax())
+            if np.isfinite(sims[best]):
+                if reliable:
+                    self._sums[best] = self._sums[best] + emb * duration
+                    self._secs[best] += duration
+                return self._remember(best)
+        if not reliable:  # unlike everyone, but too short to found a speaker
+            return self._remember(fallback)
         self._sums.append(emb * duration)
+        self._secs.append(duration)
         return self._remember(len(self._sums) - 1)
 
     def _remember(self, k: int) -> int:

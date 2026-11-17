@@ -9,7 +9,9 @@ that were never embedded live (said before the channel was switched on) are
 embedded then from the saved audio, so the labels cover the whole session.
 
 With a `VoiceBank` of known voices, a group that clearly sounds like a saved
-person is labelled with their name instead of "Local N" (see `voices`).
+person is labelled with their name instead of "Local N" (see `voices`). Live,
+the known voices are the first speakers of each channel's online clustering,
+so a known person is named from their first clear utterance.
 """
 
 from __future__ import annotations
@@ -58,6 +60,7 @@ class Diarizer:
         self._load_lock = threading.Lock()
         self._online: dict[str, OnlineClusterer] = {}
         self._history: dict[str, list[tuple[Key, np.ndarray | None, float]]] = {}
+        self._seeds: dict[str, list[str]] = {}  # channel -> names of its known-voice live speakers
         for ch in channels:
             self.set_enabled(ch, True)
 
@@ -69,7 +72,15 @@ class Diarizer:
         while it is off, so switching back on carries on with the same speakers."""
         with self._lock:
             if on:
-                self._online.setdefault(channel, OnlineClusterer(self.threshold))
+                if channel not in self._online:
+                    names, cents = [], []
+                    for name in self.voices.names() if self.voices else []:
+                        c = self.voices.get(name).centroid(channel)
+                        if c is not None:
+                            names.append(name)
+                            cents.append(c)
+                    self._seeds[channel] = names
+                    self._online[channel] = OnlineClusterer(self.threshold, seeds=cents)
                 self._history.setdefault(channel, [])
                 self.channels = self.channels | {channel}
             else:
@@ -89,10 +100,16 @@ class Diarizer:
         with self._lock:
             index = self._online[ch].assign(emb, duration)
             self._history[ch].append((key, emb, duration))
-        return speaker_label(ch, index)
+            return self._live_label(ch, index)
+
+    def _live_label(self, ch: str, index: int) -> str:
+        seeds = self._seeds.get(ch, [])
+        return seeds[index] if index < len(seeds) else speaker_label(ch, index - len(seeds))
 
     def speakers(self, channel: str) -> int:
-        return self._online[channel].n_speakers if channel in self._online else 0
+        """Speakers heard live on `channel` (known voices count once heard)."""
+        o = self._online.get(channel)
+        return sum(1 for k in range(o.n_speakers) if k >= o.n_seeds or o.seconds(k) > 0) if o else 0
 
     def missing(self, segments: Iterable[Segment]) -> int:
         """How many of these segments on diarized channels have no live embedding."""

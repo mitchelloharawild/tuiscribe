@@ -102,6 +102,7 @@ class VoiceBank:
         self.voices: dict[str, Voice] = {}  # every voice file, whatever its model
         self.unreadable: list[Path] = []
         self._paths: dict[str, Path] = {}
+        self._centroids: dict[tuple[str, str | None], np.ndarray | None] = {}  # (name, channel)
         if self.dir.is_dir():
             for path in sorted(p for p in self.dir.glob("*.npz") if not p.name.endswith(".part.npz")):
                 try:
@@ -161,12 +162,14 @@ class VoiceBank:
             v = Voice(v.name, v.model, *(a[keep] for a in (v.emb, v.duration, v.channel, v.source, v.start, v.end, v.added)))
         self._write(v)
         self.voices[name] = v
+        self._centroids.clear()
         return len(new)
 
     def remove(self, name: str) -> bool:
         v = self.voices.pop(name, None)
         if v is None:
             return False
+        self._centroids.clear()
         path = self._paths.pop(name, None)
         if path is not None:
             path.unlink(missing_ok=True)
@@ -176,7 +179,9 @@ class VoiceBank:
         """Cosine similarity of a group centroid with each matchable person."""
         out = {}
         for n in self.names():
-            c = self.voices[n].centroid(channel)
+            if (n, channel) not in self._centroids:
+                self._centroids[(n, channel)] = self.voices[n].centroid(channel)
+            c = self._centroids[(n, channel)]
             if c is not None and c.shape == centroid.shape:
                 out[n] = float(c @ centroid)
         return out

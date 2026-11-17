@@ -9,7 +9,7 @@ from tuiscribe.diarize.voices import VoiceBank
 from tuiscribe.output import sidecar_path
 from tuiscribe.records import Segment, from_json
 
-from test_diarize import A, B, AmpEmbedder, tone
+from test_diarize import A, B, C, AmpEmbedder, tone
 from test_diarize_toggle import fake_model, recorded  # noqa: F401 - fixture
 
 
@@ -97,3 +97,38 @@ def test_cli_voices_add_keeps_hand_edits(tmp_path, fake_model):
 def test_cli_voices_list_empty():
     r = CliRunner().invoke(app, ["voices", "list"])
     assert r.exit_code == 0 and "no saved voices" in r.output
+
+
+# --- live --------------------------------------------------------------------------
+
+
+def test_live_names_known_voices_from_the_first_utterance():
+    d = Diarizer(["mic"], embedder=AmpEmbedder(), voices=bank_with(Bea=B))
+    got = [d.label(("mic", float(i)), tone(amp), dur) for i, (amp, dur) in enumerate(
+        [(0.6, 3.0), (0.3, 3.0), (0.6, 0.5), (0.3, 3.0)]
+    )]
+    assert got == ["Bea", "Local 1", "Bea", "Local 1"]
+    assert d.speakers("mic") == 2
+
+
+def test_live_unknown_voice_is_not_taken_for_a_known_one():
+    from test_diarize import A_NEAR
+
+    # A_NEAR is 0.87 similar to A: joins Al. C is opposite: a new speaker.
+    d = Diarizer(["mic"], embedder=AmpEmbedder({0.3: A_NEAR, 0.6: C}), voices=bank_with(Al=A), threshold=0.3)
+    got = [d.label(("mic", float(i)), tone(amp), 3.0) for i, amp in enumerate([0.6, 0.3, 0.6])]
+    assert got == ["Local 1", "Al", "Local 1"]
+    assert d.speakers("mic") == 2
+
+
+def test_live_without_voices_numbers_from_one():
+    d = Diarizer(["mic"], embedder=AmpEmbedder())
+    assert d.label(("mic", 0.0), tone(0.6), 0.5) == "Local 1"  # too short to found a speaker
+    assert d.speakers("mic") == 0
+
+
+def test_live_known_voice_needs_seed_threshold_even_when_speaker_threshold_is_low():
+    from test_diarize import vec
+
+    d = Diarizer(["mic"], embedder=AmpEmbedder({0.3: vec(70)}), voices=bank_with(Al=A), threshold=0.3)
+    assert d.label(("mic", 0.0), tone(0.3), 3.0) == "Local 1"  # cos 70 = 0.34: not Al
