@@ -12,12 +12,18 @@ With a `VoiceBank` of known voices, a group that clearly sounds like a saved
 person is labelled with their name instead of "Local N" (see `voices`). Live,
 the known voices are the first speakers of each channel's online clustering,
 so a known person is named from their first clear utterance.
+
+A live speaker can also be named by hand (`name_speaker`). That name is
+confirmed: it goes to whichever final group holds most of that live speaker's
+speech, and `learn()` saves that group's utterances to the person's voice.
+Only confirmed names are learned, never automatic matches.
 """
 
 from __future__ import annotations
 
 import threading
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -29,6 +35,16 @@ from .voices import VoiceBank, centroid_of
 # Label stem per channel when it is diarized. The mic may hear several people
 # in the room, so its speakers are "Local N" rather than "You".
 DIARIZED_LABEL = {"mic": "Local", "system": "Remote"}
+
+@dataclass(frozen=True)
+class LiveSpeaker:
+    channel: str
+    index: int  # live speaker number, for `name_speaker`
+    label: str  # as shown now
+    seconds: float  # clear speech so far this session
+    confirmed: bool  # named by hand
+    suggestion: tuple[str, float] | None  # closest saved voice and its similarity
+
 
 Key = tuple[str, float]  # (channel, segment start) identifies a segment
 # (channel, start, end) -> that stretch of 16 kHz mono audio, or None if unavailable
@@ -61,6 +77,9 @@ class Diarizer:
         self._online: dict[str, OnlineClusterer] = {}
         self._history: dict[str, list[tuple[Key, np.ndarray | None, float]]] = {}
         self._seeds: dict[str, list[str]] = {}  # channel -> names of its known-voice live speakers
+        self._live_index: dict[str, dict[Key, int]] = {}  # channel -> segment -> live speaker
+        self._named: dict[str, dict[int, str]] = {}  # channel -> live speaker -> confirmed name
+        self.confirmed: dict[str, set[str]] = {}  # set by final_labels: channel -> hand-given names used
         for ch in channels:
             self.set_enabled(ch, True)
 
@@ -100,11 +119,42 @@ class Diarizer:
         with self._lock:
             index = self._online[ch].assign(emb, duration)
             self._history[ch].append((key, emb, duration))
+            self._live_index.setdefault(ch, {})[key] = index
             return self._live_label(ch, index)
 
     def _live_label(self, ch: str, index: int) -> str:
+        if named := self._named.get(ch, {}).get(index):
+            return named
         seeds = self._seeds.get(ch, [])
         return seeds[index] if index < len(seeds) else speaker_label(ch, index - len(seeds))
+
+    def live_speakers(self) -> list[LiveSpeaker]:
+        """Speakers heard so far on the diarized channels, for naming them."""
+        out = []
+        with self._lock:
+            for ch in sorted(self.channels):
+                o = self._online.get(ch)
+                heard = set(self._live_index.get(ch, {}).values())
+                for k in range(o.n_speakers if o else 0):
+                    if k not in heard:
+                        continue
+                    suggestion = None
+                    if self.voices:
+                        scores = self.voices.scores(o.centroid(k), ch)
+                        if scores:
+                            best = max(scores, key=scores.get)
+                            suggestion = (best, scores[best])
+                    out.append(LiveSpeaker(ch, k, self._live_label(ch, k), o.seconds(k), k in self._named.get(ch, {}), suggestion))
+        return out
+
+    def name_speaker(self, channel: str, index: int, name: str | None) -> None:
+        """Confirm live speaker `index` on `channel` as `name` (None: forget the name)."""
+        with self._lock:
+            named = self._named.setdefault(channel, {})
+            if name:
+                named[index] = name
+            else:
+                named.pop(index, None)
 
     def speakers(self, channel: str) -> int:
         """Speakers heard live on `channel` (known voices count once heard)."""
@@ -163,23 +213,61 @@ class Diarizer:
     ) -> tuple[dict[int, str], dict[str, float]]:
         """Label per group: a known voice's name if it clearly matches, else
         "Local N" numbered by first appearance among the unnamed groups."""
+        confirmed = self._confirmed_groups(ch, entries, labels)
         matched: dict = {}
         if self.voices:
             cents = {}
-            for k in sorted(set(labels)):
+            for k in sorted(set(labels) - set(confirmed)):
                 members = [(e, d) for (_, e, d), lab in zip(entries, labels) if lab == k]
                 c = centroid_of([e for e, _ in members], [d for _, d in members])
                 if c is not None:
                     cents[k] = c
-            matched = self.voices.match(cents, ch)
+            matched = self.voices.match(cents, ch, exclude=confirmed.values())
         names: dict[int, str] = {}
         n = 0
         for k in labels:  # first-appearance order
             if k in names:
                 continue
-            if k in matched:
+            if k in confirmed:
+                names[k] = confirmed[k]
+            elif k in matched:
                 names[k] = matched[k][0]
             else:
                 names[k] = speaker_label(ch, n)
                 n += 1
+        self.confirmed[ch] = set(confirmed.values())
         return names, {name: score for name, score in matched.values()}
+
+    def _confirmed_groups(
+        self, ch: str, entries: list[tuple[Key, np.ndarray | None, float]], labels: list[int]
+    ) -> dict[int, str]:
+        """Final group -> hand-given name: each named live speaker's name goes to the
+        group holding most of its speech (a group named twice keeps the larger share)."""
+        with self._lock:
+            named = dict(self._named.get(ch, {}))
+            live = dict(self._live_index.get(ch, {}))
+        best: dict[int, tuple[float, str]] = {}
+        for index, name in named.items():
+            share: dict[int, float] = {}
+            for (key, _, dur), k in zip(entries, labels):
+                if live.get(key) == index:
+                    share[k] = share.get(k, 0.0) + dur
+            if not share:
+                continue
+            k = max(share, key=share.get)
+            if share[k] > best.get(k, (0.0, ""))[0]:
+                best[k] = (share[k], name)
+        return {k: name for k, (_, name) in best.items()}
+
+    def learn(self, source: str) -> dict[str, int]:
+        """Save the utterances of each confirmed speaker (from the last `final_labels`)
+        to their voice. Returns {name: samples added}."""
+        if self.voices is None:
+            return {}
+        added: dict[str, int] = {}
+        for ch, names in self.confirmed.items():
+            for name in names:
+                entries = self.groups.get(ch, {}).get(name, [])
+                n = self.voices.add(name, [(e, key[1], key[1] + dur) for key, e, dur in entries], ch, source)
+                added[name] = added.get(name, 0) + n
+        return added

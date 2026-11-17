@@ -555,6 +555,8 @@ def _print_summary(controller: Controller) -> None:
         typer.echo(f"transcript: {controller.writer.md_path} ({controller.writer.segments} segments), sidecar: {controller.writer.jsonl_path}")
     if controller.relabelled:
         typer.echo(f"speaker labels revised for {controller.relabelled} segments after the session")
+    if controller.learned:
+        typer.echo("voice samples saved: " + ", ".join(f"{n} +{k}" for n, k in sorted(controller.learned.items())))
     for ch, secs in controller.saved_seconds().items():
         typer.echo(f"audio: {controller.audio_paths[ch]} ({secs:.1f} s)")
 

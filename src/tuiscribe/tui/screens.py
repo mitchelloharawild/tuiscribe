@@ -1,4 +1,4 @@
-"""Modal screens: source picker, note input, help."""
+"""Modal screens: source picker, speaker labels and names, note input, help."""
 
 from __future__ import annotations
 
@@ -12,6 +12,10 @@ from textual.widgets.option_list import Option
 
 from ..capture.devices import Device, DeviceError, list_devices
 from ..config import CHANNEL_LABELS
+from ..diarize import LiveSpeaker
+from ..diarize.cluster import SEED_THRESHOLD
+
+NAME_SPEAKERS = "__names__"  # DiarizePicker result: open the SpeakerNamer
 
 MODAL_CSS = """
 {name} {{ align: center middle; }}
@@ -83,11 +87,12 @@ class DiarizePicker(ModalScreen[str | None]):
     DEFAULT_CSS = MODAL_CSS.format(name="DiarizePicker")
     BINDINGS = [Binding("escape", "dismiss(None)", "cancel")]
 
-    def __init__(self, channels: list[str], enabled: set[str], saved_audio: set[str]) -> None:
+    def __init__(self, channels: list[str], enabled: set[str], saved_audio: set[str], speakers: int = 0) -> None:
         super().__init__()
         self.channels = channels
         self.enabled = enabled
         self.saved_audio = saved_audio
+        self.speakers = speakers  # heard so far on the enabled inputs
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -102,6 +107,11 @@ class DiarizePicker(ModalScreen[str | None]):
                 if ch not in self.saved_audio:
                     t.append("  audio not saved: from now only", "yellow")
                 options.append(Option(t, id=ch))
+            if self.speakers:
+                t = Text("✎      ")
+                t.append("Name speakers…", "bold")
+                t.append(f"  {self.speakers} heard so far", "dim")
+                options.append(Option(t, id=NAME_SPEAKERS))
             yield OptionList(*options)
             yield Static(
                 "enter: switch on/off · esc: cancel\n"
@@ -114,6 +124,77 @@ class DiarizePicker(ModalScreen[str | None]):
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         self.dismiss(event.option.id)
+
+
+class SpeakerNamer(ModalScreen[LiveSpeaker | None]):
+    """Pick a live speaker to name. Returns it, or None."""
+
+    DEFAULT_CSS = MODAL_CSS.format(name="SpeakerNamer")
+    BINDINGS = [Binding("escape", "dismiss(None)", "cancel")]
+
+    def __init__(self, speakers: list[LiveSpeaker], saving: bool) -> None:
+        super().__init__()
+        self.speakers = speakers
+        self.saving = saving  # confirmed voices are saved at stop
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label("Name speakers")
+            options = []
+            for i, sp in enumerate(self.speakers):
+                t = Text()
+                t.append("✓ " if sp.confirmed else "  ", "green")
+                t.append(f"{CHANNEL_LABELS[sp.channel]:<7}", "dim")
+                t.append(f"{sp.label:<16}", "bold")
+                t.append(f"{sp.seconds:>5.0f} s speech", "dim")
+                if sp.suggestion and not sp.confirmed:
+                    name, score = sp.suggestion
+                    if name == sp.label:
+                        t.append(f"  saved voice ({score:.2f}): confirm?", "cyan")
+                    elif score >= SEED_THRESHOLD:
+                        t.append(f"  sounds a bit like {name} ({score:.2f})", "dim")
+                options.append(Option(t, id=str(i)))
+            yield OptionList(*options)
+            saved = "Named speakers' voices are saved when you stop, so later sessions know them. " if self.saving else ""
+            yield Static(
+                f"enter: name · esc: cancel\n{saved}Only name someone you are sure of.",
+                classes="hint",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one(OptionList).focus()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(self.speakers[int(event.option.id)])
+
+
+class SpeakerNameInput(ModalScreen[str | None]):
+    """Type a speaker's name. Returns the name, "" to forget it, or None if cancelled."""
+
+    DEFAULT_CSS = MODAL_CSS.format(name="SpeakerNameInput")
+    BINDINGS = [Binding("escape", "dismiss(None)", "cancel")]
+
+    def __init__(self, speaker: LiveSpeaker, known: list[str]) -> None:
+        super().__init__()
+        self.speaker = speaker
+        self.known = known
+
+    def compose(self) -> ComposeResult:
+        sp = self.speaker
+        guess = sp.label if sp.confirmed or (sp.suggestion and sp.suggestion[0] == sp.label) else ""
+        with Vertical():
+            yield Label(f"Who is {sp.label} ({CHANNEL_LABELS[sp.channel]})?")
+            yield Input(value=guess, placeholder="their name")
+            hint = "enter: save · empty: forget the name · esc: cancel"
+            if self.known:
+                hint += "\nSaved voices: " + ", ".join(self.known)
+            yield Static(hint, classes="hint")
+
+    def on_mount(self) -> None:
+        self.query_one(Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value.strip())
 
 
 class NoteInput(ModalScreen[str | None]):
@@ -138,7 +219,7 @@ HELP = [
     ("M / S", "mute or unmute mic / system (muted audio is not transcribed)"),
     ("space", "pause or resume transcription (meters keep running)"),
     ("n", "insert a note or heading into the transcript"),
-    ("d", "speaker labels on/off per input (e.g. several people on one mic)"),
+    ("d", "speaker labels on/off per input (e.g. several people on one mic); name speakers"),
     ("?", "this help"),
     ("q / ctrl+c", "stop: transcribe remaining speech, write footer, exit"),
 ]

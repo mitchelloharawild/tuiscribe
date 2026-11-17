@@ -26,6 +26,7 @@ from .events import (
     Command,
     EventBus,
     LevelEvent,
+    NameSpeaker,
     Quit,
     SetDiarize,
     SetMute,
@@ -67,6 +68,7 @@ class Controller:
         self.partials = partials
         self.diarizer = diarizer
         self.relabelled = 0  # segments whose speaker changed in the end-of-session re-clustering
+        self.learned: dict[str, int] = {}  # voice samples saved at stop, per confirmed name
         self.muted: dict[str, bool] = {ch: False for ch in devices}
         self.paused = False
         self.session_start = 0.0
@@ -169,6 +171,26 @@ class Controller:
             return
         if self.relabelled:
             self.bus.publish(StatusEvent("info", f"speaker labels revised for {self.relabelled} segments"))
+        if self.diarizer is not None:
+            self._learn_voices()
+
+    def _learn_voices(self) -> None:
+        """Save the voices of the speakers named by hand this session."""
+        d = self.diarizer
+        assert d is not None and self.writer is not None
+        if not any(d.confirmed.values()):
+            return
+        if d.voices is None:
+            self.bus.publish(StatusEvent("info", "voices not saved (--no-voices)"))
+            return
+        try:
+            added = d.learn(str(self.writer.md_path.resolve()))
+        except (OSError, ValueError) as e:
+            self.bus.publish(StatusEvent("error", f"could not save voices: {e}"))
+            return
+        self.learned = added
+        msg = ", ".join(f"{name} +{n}" for name, n in sorted(added.items()))
+        self.bus.publish(StatusEvent("info", f"voice samples saved: {msg}"))
 
     def _final_speakers(self) -> dict[tuple[str, float], str | None]:
         """Whichever channels are diarized when the session stops get labels for the
@@ -217,6 +239,8 @@ class Controller:
                     self.bus.publish(StatusEvent("info", "transcription paused" if new else "transcription resumed"))
                 case SetDiarize(channel, on):
                     self._set_diarize(channel, on)
+                case NameSpeaker(channel, index, name):
+                    self._name_speaker(channel, index, name)
                 case AddNote(text):
                     if self.pipeline is None:
                         self.bus.publish(StatusEvent("warning", "notes need transcription enabled"))
@@ -245,6 +269,22 @@ class Controller:
         self.bus.publish(StatusEvent("info", msg, channel))
         if not d.ready:
             threading.Thread(target=self._load_diarizer, args=(channel,), name="speaker-model", daemon=True).start()
+
+    def _name_speaker(self, channel: str, index: int, name: str | None) -> None:
+        d = self.diarizer
+        if d is None or not d.applies(channel):
+            return
+        before = next((sp.label for sp in d.live_speakers() if sp.channel == channel and sp.index == index), None)
+        d.name_speaker(channel, index, name)
+        after = next((sp.label for sp in d.live_speakers() if sp.channel == channel and sp.index == index), None)
+        if name == before:
+            msg = f"{name} confirmed" + ("" if d.voices is None else f"; {name}'s saved voice is updated when you stop")
+        elif name:
+            keep = "" if d.voices is None else f" and {name}'s voice is saved"
+            msg = f"{before} is {name} from now; when you stop, earlier lines are relabelled{keep}"
+        else:
+            msg = f"{before} is no longer named; now {after}"
+        self.bus.publish(StatusEvent("info", msg, channel))
 
     def _load_diarizer(self, channel: str) -> None:
         d = self.diarizer

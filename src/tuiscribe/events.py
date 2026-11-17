@@ -98,11 +98,20 @@ class SetDiarize:
 
 
 @dataclass(frozen=True)
+class NameSpeaker:
+    """Confirm who a live speaker is; their voice is saved when the session stops."""
+
+    channel: str
+    index: int  # live speaker number (LiveSpeaker.index)
+    name: str | None  # None: forget the name given earlier
+
+
+@dataclass(frozen=True)
 class Quit:
     pass
 
 
-Command = SetMute | SwitchSource | SetPause | AddNote | SetDiarize | Quit
+Command = SetMute | SwitchSource | SetPause | AddNote | SetDiarize | NameSpeaker | Quit
 
 
 # --- bus --------------------------------------------------------------------

@@ -22,9 +22,11 @@ from textual.widgets import Footer, RichLog, Static
 from ..capture.devices import Device
 from ..config import CHANNEL_LABELS
 from ..controller import Controller
+from ..diarize import LiveSpeaker
 from ..events import (
     AddNote,
     FinalEvent,
+    NameSpeaker,
     PartialEvent,
     SetDiarize,
     SetMute,
@@ -34,7 +36,7 @@ from ..events import (
     SwitchSource,
 )
 from .meters import FRAME_S, Meter
-from .screens import DiarizePicker, HelpScreen, NoteInput, SourcePicker
+from .screens import NAME_SPEAKERS, DiarizePicker, HelpScreen, NoteInput, SourcePicker, SpeakerNameInput, SpeakerNamer
 from .transcript import TranscriptView
 
 
@@ -247,10 +249,31 @@ class TuiscribeApp(App):
             return
 
         def chosen(channel: str | None) -> None:
-            if channel is not None and not self._finishing:
+            if channel == NAME_SPEAKERS:
+                self._name_speakers()
+            elif channel is not None and not self._finishing:
                 c.apply(SetDiarize(channel))
 
-        self.push_screen(DiarizePicker(c.channels, set(c.diarizer.channels), set(c.audio_paths)), chosen)
+        heard = len(c.diarizer.live_speakers())
+        self.push_screen(DiarizePicker(c.channels, set(c.diarizer.channels), set(c.audio_paths), heard), chosen)
+
+    def _name_speakers(self) -> None:
+        d = self.controller.diarizer
+        speakers = d.live_speakers() if d is not None else []
+        if not speakers or self._finishing:
+            return
+
+        def picked(sp: LiveSpeaker | None) -> None:
+            if sp is None or self._finishing:
+                return
+
+            def named(name: str | None) -> None:
+                if name is not None and not self._finishing:
+                    self.controller.apply(NameSpeaker(sp.channel, sp.index, name or None))
+
+            self.push_screen(SpeakerNameInput(sp, d.voices.names() if d.voices else []), named)
+
+        self.push_screen(SpeakerNamer(speakers, saving=d.voices is not None), picked)
 
     def action_help(self) -> None:
         self.push_screen(HelpScreen())

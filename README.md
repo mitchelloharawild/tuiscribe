@@ -51,7 +51,7 @@ tuiscribe record -o standup.md --diarize system
 | `M` / `S` | mute or unmute it |
 | `space` | pause or resume |
 | `n` | add a note or heading |
-| `d` | speaker labels on or off for an input |
+| `d` | speaker labels on or off for an input; name speakers |
 | `q` | stop: finishes the last utterances, then exits |
 
 Other commands:
@@ -103,8 +103,10 @@ merged into one, raise it.
 
 ### Known speakers
 
-Save someone's voice from a transcript where their label is right, and later
-sessions name them instead of numbering them:
+Name someone during a session (`d`, then *Name speakers…*) and their voice is
+saved when you stop, so later sessions name them instead of numbering them. The
+same list lets you confirm a saved voice, which adds this session's speech to it.
+Or save a voice from a finished transcript where their label is right:
 
 ```sh
 tuiscribe voices add Simon standup.md --label "Local 2"   # also relabels Local 2 as Simon there

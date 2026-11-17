@@ -132,3 +132,89 @@ def test_live_known_voice_needs_seed_threshold_even_when_speaker_threshold_is_lo
 
     d = Diarizer(["mic"], embedder=AmpEmbedder({0.3: vec(70)}), voices=bank_with(Al=A), threshold=0.3)
     assert d.label(("mic", 0.0), tone(0.3), 3.0) == "Local 1"  # cos 70 = 0.34: not Al
+
+
+# --- naming by hand ----------------------------------------------------------------
+
+
+def labelled(d, amps, dur=3.0):
+    return [d.label(("mic", float(i)), tone(amp), dur) for i, amp in enumerate(amps)]
+
+
+def test_name_speaker_live_then_final_and_learn():
+    bank = VoiceBank()
+    d = Diarizer(["mic"], embedder=AmpEmbedder(), voices=bank)
+    assert labelled(d, [0.3, 0.6]) == ["Local 1", "Local 2"]
+    sp = {s.label: s for s in d.live_speakers()}
+    assert set(sp) == {"Local 1", "Local 2"} and sp["Local 1"].seconds == 3.0 and not sp["Local 1"].confirmed
+    d.name_speaker("mic", sp["Local 2"].index, "Bea")
+    assert d.label(("mic", 2.0), tone(0.6), 3.0) == "Bea"
+    assert [s.label for s in d.live_speakers() if s.confirmed] == ["Bea"]
+    labels = d.final_labels()
+    assert [labels[("mic", float(i))] for i in range(3)] == ["Local 1", "Bea", "Bea"]
+    assert d.learn("talk.md") == {"Bea": 2}  # only confirmed names are learned
+    assert bank.names() == ["Bea"] and sorted(bank.get("Bea").start) == [1.0, 2.0]
+    assert d.learn("talk.md") == {"Bea": 0}
+
+
+def test_confirming_a_known_voice_adds_to_it():
+    bank = bank_with(Bea=B)
+    d = Diarizer(["mic"], embedder=AmpEmbedder(), voices=bank)
+    assert labelled(d, [0.6]) == ["Bea"]
+    (sp,) = d.live_speakers()
+    assert sp.suggestion[0] == "Bea" and sp.suggestion[1] > 0.99
+    d.name_speaker("mic", sp.index, "Bea")
+    d.final_labels()
+    assert d.learn("new.md") == {"Bea": 1} and len(bank.get("Bea")) == 3
+
+
+def test_unnaming_and_automatic_matches_are_not_learned():
+    bank = bank_with(Bea=B)
+    d = Diarizer(["mic"], embedder=AmpEmbedder(), voices=bank)
+    labelled(d, [0.6, 0.3])
+    local = next(s for s in d.live_speakers() if s.label == "Local 1")
+    d.name_speaker("mic", local.index, "Al")
+    d.name_speaker("mic", local.index, None)
+    assert d.live_speakers()[1].label == "Local 1"
+    d.final_labels()
+    assert d.learn("x.md") == {} and len(bank.get("Bea")) == 2
+
+
+def test_hand_name_beats_a_saved_voice_for_the_same_group():
+    bank = bank_with(Bea=B)
+    d = Diarizer(["mic"], embedder=AmpEmbedder(), voices=bank)
+    labelled(d, [0.6, 0.6])
+    d.name_speaker("mic", 0, "Bianca")  # "Bea" was wrong
+    labels = d.final_labels()
+    assert set(labels.values()) == {"Bianca"}
+    assert d.learn("x.md") == {"Bianca": 2}
+
+
+def test_learn_without_voices_does_nothing():
+    d = Diarizer(["mic"], embedder=AmpEmbedder())
+    labelled(d, [0.3])
+    d.name_speaker("mic", 0, "Al")
+    assert d.final_labels() == {("mic", 0.0): "Al"}
+    assert d.learn("x.md") == {}
+
+
+def test_controller_names_speaker_and_saves_voice_at_stop(tmp_path):
+    from tuiscribe.events import NameSpeaker, SetDiarize, StatusEvent
+    from test_diarize_toggle import SPANS, session, wait_for
+
+    c = session(tmp_path)
+    c.diarizer.voices = VoiceBank()
+    c.apply(SetDiarize("mic", True))
+    assert wait_for(lambda: c.diarizer.ready)
+    for a, b, amp in SPANS:
+        c.writer.item(Segment("mic", a, b, "x", speaker=c.diarizer.label(("mic", a), tone(amp), b - a)))
+    c.bus.drain()
+    c.apply(NameSpeaker("mic", 1, "Bea"))
+    msgs = [e.message for e in c.bus.drain() if isinstance(e, StatusEvent)]
+    assert msgs == ["Local 2 is Bea from now; when you stop, earlier lines are relabelled and Bea's voice is saved"]
+    c._relabel()
+    assert [s.speaker for s in c.writer.session_segments()] == ["Local 1", "Bea", "Local 1"]
+    assert c.learned == {"Bea": 1}
+    assert any("voice samples saved: Bea +1" in e.message for e in c.bus.drain() if isinstance(e, StatusEvent))
+    v = VoiceBank().get("Bea")
+    assert v.source[0] == str((tmp_path / "m.md").resolve())
